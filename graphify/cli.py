@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+from graphify.generation._manifest import _stamped_manifest_files
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
 from pathlib import Path
 
@@ -80,69 +81,8 @@ _GEMINI_NUDGE_TEXT = (
     'for broad architecture context.'
 )
 
-
 def _default_graph_path() -> str:
     return str(Path(_GRAPHIFY_OUT) / "graph.json")
-
-
-def _stamped_manifest_files(
-    files_by_type: dict[str, list[str]],
-    sem_result: dict,
-    root: Path,
-    partial_source_files: "set[str] | None" = None,
-) -> dict[str, list[str]]:
-    """Manifest-safe files dict: only stamp semantic files that actually
-    produced output (cache hit or fresh extraction). Files whose chunk failed
-    have no source_file entry in sem_result — leaving their semantic_hash
-    empty so detect_incremental re-queues them (#933).
-
-    A file in ``partial_source_files`` DID produce output this run, but only a
-    truncated fragment of it, so it is excluded from stamping too — otherwise
-    detect_incremental would see it "done" and never re-dispatch it, leaving the
-    incomplete node set live forever on the warm-incremental path. Same #933
-    mechanism: leave it unstamped and it is re-queued next run.
-
-    Both sides of the membership test are resolved against the scan ``root``
-    before comparing (#1897): node/edge/hyperedge ``source_file`` values are
-    root-relative on a fresh extraction while ``files_by_type`` entries are
-    absolute (from detect()), so a raw string comparison never matched and
-    every freshly-extracted semantic doc was dropped from the manifest.
-    Mirrors the #1890 path normalization in graphify.llm.
-
-    Hyperedges are counted as output (#1920): a chunk whose only result for a
-    document is a hyperedge (3+ nodes sharing a concept) is valid output that
-    the semantic cache persists per-``source_file`` — omitting it here left the
-    doc unstamped, so detect_incremental re-queued it on every run. The stamping
-    condition mirrors the cache-write keying (a hyperedge carries its own
-    ``source_file``); do not derive it from member nodes.
-    """
-    root = Path(root)
-
-    def _resolve(value: str) -> Path:
-        p = Path(value)
-        if not p.is_absolute():
-            p = root / p
-        try:
-            return p.resolve()
-        except (OSError, RuntimeError):
-            return p
-
-    sem_extracted: set[Path] = set()
-    for coll in ("nodes", "edges", "hyperedges"):
-        for item in sem_result.get(coll, []):
-            sf = item.get("source_file", "")
-            if sf:
-                sem_extracted.add(_resolve(sf))
-    partial_resolved = {_resolve(p) for p in (partial_source_files or set())}
-    sem_types = {"document", "paper", "image"}
-    return {
-        ftype: [
-            f for f in flist
-            if ftype not in sem_types
-            or (_resolve(f) in sem_extracted and _resolve(f) not in partial_resolved)
-        ]
-        for ftype, flist in files_by_type.items()
-    }
 
 
 def _stale_graph_sources(
@@ -340,6 +280,10 @@ def _prune_graph_json_sources(graph_path: Path, stale_sources: list[str]) -> int
     newly-excluded file's nodes survive forever (#1909).
     ``stale_sources`` comes from :func:`_stale_graph_sources`, i.e. the
     graph's own ``source_file`` spellings, so exact string matching is enough.
+
+    Raises ``RuntimeError`` if the canonical owner cannot publish the pruned
+    graph; callers must not report a successful prune while the old graph
+    remains active.
     """
     try:
         data = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -374,10 +318,26 @@ def _prune_graph_json_sources(graph_path: Path, stale_sources: list[str]) -> int
     data[links_key] = kept_edges
     if "hyperedges" in data:
         data["hyperedges"] = kept_hyper
-    from graphify.export import backup_if_protected as _backup
-    _backup(graph_path.parent)
-    from graphify.paths import write_json_atomic
-    write_json_atomic(graph_path, data, indent=2)
+    from graphify.generation import (
+        CodeUpdateRequest,
+        Corpus,
+        CorpusGraph,
+        GenerationPublished,
+    )
+    from graphify.generation._publication import _GraphData, _Publication
+
+    outcome = CorpusGraph(
+        Corpus(root=graph_path.parent.parent, output=graph_path.parent)
+    ).code_update(
+        CodeUpdateRequest(tuple(Path(source) for source in stale_sources)),
+        _publication=_Publication(
+            graph=_GraphData(data, force=True),
+            protect_previous=True,
+        ),
+    )
+    if not isinstance(outcome, GenerationPublished):
+        reason = getattr(outcome, "reason", type(outcome).__name__)
+        raise RuntimeError(f"could not publish pruned graph: {reason}")
     return n_removed
 
 
@@ -1621,7 +1581,7 @@ def dispatch_command(cmd: str) -> None:
             suggest_questions,
         )
         from graphify.report import generate
-        from graphify.export import to_json, to_html
+        from graphify.export import to_html
 
         stages = _StageTimer(co_timing)
         print("Loading existing graph...")
@@ -1812,10 +1772,6 @@ def dispatch_command(cmd: str) -> None:
                           tokens, str(watch_path), suggested_questions=questions,
                           min_community_size=min_community_size, built_at_commit=_commit,
                           learning=_llfr(out / "graph.json"))
-        (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
-        stages.mark("report")
-        from graphify.export import backup_if_protected as _backup
-        _backup(out)
         analysis = {
             "communities": {str(k): v for k, v in communities.items()},
             "cohesion": {str(k): v for k, v in cohesion.items()},
@@ -1823,23 +1779,49 @@ def dispatch_command(cmd: str) -> None:
             "surprises": surprises,
             "questions": questions,
         }
-        (out / ".graphify_analysis.json").write_text(
-            json.dumps(analysis, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        # Canonical graph, report, analysis, and label state cross the CorpusGraph
+        # boundary together. HTML below remains a post-commit derivative.
+        from graphify.generation import (
+            Corpus,
+            CorpusGraph,
+            OperationFailed,
+            PublicationRefused,
+            ReclusteringRequest,
         )
-        to_json(G, communities, str(out / "graph.json"), community_labels=labels)
-        # Don't persist placeholder-only labels (or their .sig): leaving the
-        # sidecar absent lets a later run generate real labels instead of reading
-        # back "Community N" as authoritative (#2073).
-        if not placeholder_only:
-            from graphify.paths import write_json_atomic as _wja
-            _wja(labels_path, {str(k): v for k, v in labels.items()}, ensure_ascii=False)
-            # Membership signatures beside the labels so a later cluster-only can
-            # detect which communities changed and avoid reusing a stale label
-            # (see reuse above).
-            from graphify.cluster import community_member_sigs as _cms
-            (labels_path.parent / (labels_path.name + ".sig")).write_text(
-                json.dumps({str(k): v for k, v in _cms(communities).items()}), encoding="utf-8")
+        from graphify.generation._publication import _GraphModel, _Publication
+        from graphify.cluster import community_member_sigs as _cms
+
+        _label_payload = (
+            {str(k): v for k, v in labels.items()}
+            if not placeholder_only
+            else None
+        )
+        _signature_payload = (
+            {str(k): v for k, v in _cms(communities).items()}
+            if not placeholder_only
+            else None
+        )
+        _outcome = CorpusGraph(
+            Corpus(root=watch_path, output=out)
+        ).reclustering(
+            ReclusteringRequest(),
+            _publication=_Publication(
+                graph=_GraphModel(
+                    G,
+                    communities,
+                    community_labels=labels,
+                ),
+                report=report,
+                analysis=analysis,
+                labels=_label_payload,
+                label_signatures=_signature_payload,
+                protect_previous=True,
+            ),
+        )
+        if isinstance(_outcome, (PublicationRefused, OperationFailed)):
+            print(f"error: {_outcome.reason}", file=sys.stderr)
+            sys.exit(1)
+        stages.mark("report")
 
         # Mirror watch.py pattern: gate to_html so core outputs (graph.json +
         # GRAPH_REPORT.md) always land. Honor --no-viz explicitly; otherwise
@@ -2056,8 +2038,36 @@ def dispatch_command(cmd: str) -> None:
             out_data = _jg.node_link_data(merged, edges="links")
         except TypeError:
             out_data = _jg.node_link_data(merged)
-        from graphify.paths import write_json_atomic
-        write_json_atomic(_current_path, out_data, indent=2)
+        from graphify.generation import (
+            CodeUpdateRequest,
+            Corpus,
+            CorpusGraph,
+            OperationFailed,
+            PublicationRefused,
+        )
+        from graphify.generation._publication import _GraphData, _Publication
+
+        _merge_target = Path(_current_path)
+        _merge_output = _merge_target.parent
+        _merge_root = (
+            _merge_output.parent
+            if _merge_output.name == Path(_GRAPHIFY_OUT).name
+            else _merge_output
+        )
+        _merge_outcome = CorpusGraph(
+            Corpus(root=_merge_root, output=_merge_output)
+        ).code_update(
+            CodeUpdateRequest(),
+            _publication=_Publication(
+                graph=_GraphData(out_data, force=True),
+            ),
+        )
+        if isinstance(_merge_outcome, (PublicationRefused, OperationFailed)):
+            print(
+                f"[graphify merge-driver] publication failed: {_merge_outcome.reason}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         sys.exit(0)
 
     elif cmd == "merge-graphs":
@@ -2129,9 +2139,37 @@ def dispatch_command(cmd: str) -> None:
             out_data = _jg.node_link_data(merged, edges="links")
         except TypeError:
             out_data = _jg.node_link_data(merged)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        from graphify.paths import write_json_atomic as _wja
-        _wja(out_path, out_data, indent=2)
+        if (
+            out_path.name == "graph.json"
+            and out_path.parent.name == Path(_GRAPHIFY_OUT).name
+        ):
+            # The monorepo runbook intentionally targets canonical graph.json;
+            # enter CorpusGraph instead of letting this export path become a
+            # competing generation writer.
+            from graphify.generation import (
+                CodeUpdateRequest,
+                Corpus,
+                CorpusGraph,
+                OperationFailed,
+                PublicationRefused,
+            )
+            from graphify.generation._publication import _GraphData, _Publication
+
+            _merge_outcome = CorpusGraph(
+                Corpus(root=out_path.parent.parent, output=out_path.parent)
+            ).code_update(
+                CodeUpdateRequest(),
+                _publication=_Publication(
+                    graph=_GraphData(out_data, force=True),
+                ),
+            )
+            if isinstance(_merge_outcome, (PublicationRefused, OperationFailed)):
+                print(f"error: {_merge_outcome.reason}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            from graphify.paths import write_json_atomic as _wja
+            _wja(out_path, out_data, indent=2)
         print(f"Merged {len(graphs)} graphs -> {merged.number_of_nodes()} nodes, {merged.number_of_edges()} edges")
         print(f"Written to: {out_path}")
 
@@ -2748,6 +2786,7 @@ def dispatch_command(cmd: str) -> None:
             graphify_out,
             excludes=cli_excludes or None,
             gitignore=False if no_gitignore else None,
+            root=target,
         )
 
         stages = _StageTimer(cli_timing)
@@ -2755,7 +2794,6 @@ def dispatch_command(cmd: str) -> None:
         from graphify.detect import (
             detect as _detect,
             detect_incremental as _detect_incremental,
-            save_manifest as _save_manifest,
         )
         manifest_path = graphify_out / "manifest.json"
         existing_graph_path = graphify_out / "graph.json"
@@ -3296,15 +3334,6 @@ def dispatch_command(cmd: str) -> None:
             if has_path else None
         )
 
-        def _invalidate_file_manifest_for_db_graph() -> None:
-            if has_path:
-                return
-            try:
-                manifest_path.unlink(missing_ok=True)
-            except OSError as exc:
-                print(f"error: could not invalidate file manifest: {exc}", file=sys.stderr)
-                sys.exit(1)
-
         if no_cluster:
             # --no-cluster: dump the raw merged extraction as graph.json.
             # No NetworkX, no community detection, no analysis sidecar.
@@ -3314,7 +3343,6 @@ def dispatch_command(cmd: str) -> None:
             # anchors emitted per importing file, #1327).
             from graphify.build import dedupe_edges as _dedupe_edges, dedupe_nodes as _dedupe_nodes
             from graphify.export import (
-                backup_if_protected as _backup,
                 existing_graph_node_count as _existing_graph_node_count,
             )
             if (
@@ -3345,10 +3373,37 @@ def dispatch_command(cmd: str) -> None:
                     "[graphify extract] no incremental changes detected "
                     "(--no-cluster); outputs left untouched."
                 )
-                try:
-                    _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic)
-                except Exception as exc:
-                    print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+                from graphify.generation import (
+                    Corpus,
+                    CorpusGraph,
+                    FullExtractionRequest,
+                    OperationFailed,
+                )
+                from graphify.generation._publication import (
+                    _ManifestUpdate,
+                    _Publication,
+                )
+
+                _manifest_outcome = CorpusGraph(
+                    Corpus(root=target, output=graphify_out)
+                ).full_extraction(
+                    FullExtractionRequest(),
+                    _publication=_Publication(
+                        manifest=_ManifestUpdate(
+                            files=_manifest_files,
+                            kind="both",
+                            root=target,
+                            scan_corpus=_scan_corpus,
+                            clear_semantic=_cleared_semantic,
+                        )
+                    ),
+                )
+                if isinstance(_manifest_outcome, OperationFailed):
+                    print(
+                        "[graphify extract] warning: could not write manifest: "
+                        f"{_manifest_outcome.reason}",
+                        file=sys.stderr,
+                    )
                 stages.total()
                 sys.exit(0)
 
@@ -3420,20 +3475,44 @@ def dispatch_command(cmd: str) -> None:
                         file=sys.stderr,
                     )
                     sys.exit(1)
-            _backup(graphify_out)
-            _invalidate_file_manifest_for_db_graph()
-            from graphify.paths import write_json_atomic as _write_json_atomic
-            _write_json_atomic(graph_json_path, merged, indent=2)
-            try:
-                # Record the scan root so a later build_merge / update runbook can
-                # relativize deleted-file paths correctly even for a custom --out
-                # (its grandparent-of-graph.json fallback points at the wrong dir
-                # otherwise, and deleted files never prune — #2012/#1571).
-                (graphify_out / ".graphify_root").write_text(
-                    str(Path(target).resolve()), encoding="utf-8"
-                )
-            except OSError:
-                pass
+            from graphify.generation import (
+                Corpus,
+                CorpusGraph,
+                FullExtractionRequest,
+                OperationFailed,
+                PublicationRefused,
+            )
+            from graphify.generation._publication import (
+                _CanonicalArtifact,
+                _GraphData,
+                _ManifestUpdate,
+                _Publication,
+            )
+
+            _corpus_graph = CorpusGraph(Corpus(root=target, output=graphify_out))
+            _raw_outcome = _corpus_graph.full_extraction(
+                FullExtractionRequest(),
+                _publication=_Publication(
+                    graph=_GraphData(
+                        merged,
+                        force=cli_allow_partial or not _extraction_incomplete,
+                    ),
+                    # Record the scan root so later merge/update paths can
+                    # relativize deletions under custom --out (#2012/#1571).
+                    root_marker=str(Path(target).resolve()),
+                    # A pathless database graph has no file manifest. Retire it
+                    # only after backup custody has captured the prior state.
+                    retire=(
+                        frozenset({_CanonicalArtifact.MANIFEST})
+                        if not has_path
+                        else frozenset()
+                    ),
+                    protect_previous=True,
+                ),
+            )
+            if isinstance(_raw_outcome, (PublicationRefused, OperationFailed)):
+                print(f"[graphify extract] error: {_raw_outcome.reason}", file=sys.stderr)
+                sys.exit(1)
             stages.mark("write")
             cost = _estimate_cost(
                 backend, merged["input_tokens"], merged["output_tokens"]
@@ -3450,11 +3529,25 @@ def dispatch_command(cmd: str) -> None:
                     f"{merged['output_tokens']:,} out, "
                     f"est. cost: ${cost:.4f}"
                 )
-            try:
-                if has_path:
-                    _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic)
-            except Exception as exc:
-                print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+            if has_path:
+                _manifest_outcome = _corpus_graph.full_extraction(
+                    FullExtractionRequest(),
+                    _publication=_Publication(
+                        manifest=_ManifestUpdate(
+                            files=_manifest_files,
+                            kind="both",
+                            root=target,
+                            scan_corpus=_scan_corpus,
+                            clear_semantic=_cleared_semantic,
+                        )
+                    ),
+                )
+                if isinstance(_manifest_outcome, OperationFailed):
+                    print(
+                        "[graphify extract] warning: could not write manifest: "
+                        f"{_manifest_outcome.reason}",
+                        file=sys.stderr,
+                    )
             if global_merge:
                 from graphify.global_graph import global_add as _global_add
                 _tag = global_repo_tag or target.name
@@ -3473,11 +3566,9 @@ def dispatch_command(cmd: str) -> None:
         # Build graph + cluster + score + write.
         from graphify.build import (
             build as _build,
-            build_from_json as _build_from_json,
             build_merge as _build_merge,
         )
         from graphify.cluster import cluster as _cluster, score_all as _score_all
-        from graphify.export import to_json as _to_json
         from graphify.analyze import god_nodes as _god_nodes, surprising_connections as _surprising
         dedup_backend = backend if dedup_llm else None
         if incremental_mode:
@@ -3522,9 +3613,6 @@ def dispatch_command(cmd: str) -> None:
             surprises = []
         stages.mark("analyze")
 
-        from graphify.export import backup_if_protected as _backup
-        _backup(graphify_out)
-        _invalidate_file_manifest_for_db_graph()
         # force=True bypasses the #479 shrink guard entirely. A full build
         # legitimately shrinks (fuzzy dedup collapse, deleted code) so it keeps
         # force=True — EXCEPT when this run's extraction was incomplete (an
@@ -3543,8 +3631,55 @@ def dispatch_command(cmd: str) -> None:
         # passing --allow-partial (the good graph is preserved and the manifest
         # is not stamped, so the retry re-extracts).
         _force_write = cli_allow_partial or not _extraction_incomplete
-        _wrote = _to_json(G, communities, str(graph_json_path), force=_force_write)
-        if not _wrote:
+        analysis = {
+            "communities": {str(k): v for k, v in communities.items()},
+            "cohesion": {str(k): v for k, v in cohesion.items()},
+            "gods": gods,
+            "surprises": surprises,
+            "tokens": {
+                "input": merged["input_tokens"],
+                "output": merged["output_tokens"],
+            },
+        }
+        from graphify.generation import (
+            Corpus,
+            CorpusGraph,
+            FullExtractionRequest,
+            OperationFailed,
+            PublicationRefused,
+        )
+        from graphify.generation._publication import (
+            _CanonicalArtifact,
+            _GraphModel,
+            _ManifestUpdate,
+            _Publication,
+        )
+
+        _corpus_graph = CorpusGraph(Corpus(root=target, output=graphify_out))
+        _full_outcome = _corpus_graph.full_extraction(
+            FullExtractionRequest(),
+            _publication=_Publication(
+                graph=_GraphModel(G, communities, force=_force_write),
+                analysis=analysis,
+                # Persist the scan root so build_merge can relativize deletions
+                # under a custom --out (#2012/#1571).
+                root_marker=str(Path(target).resolve()),
+                semantic_marker=(
+                    {"output_tokens": merged["output_tokens"]}
+                    if merged.get("output_tokens", 0) > 0
+                    else None
+                ),
+                # Preserve the established backup-before-invalidation order for
+                # pathless database extractions.
+                retire=(
+                    frozenset({_CanonicalArtifact.MANIFEST})
+                    if not has_path
+                    else frozenset()
+                ),
+                protect_previous=True,
+            ),
+        )
+        if isinstance(_full_outcome, PublicationRefused):
             # The shrink guard refused: this partial build is smaller than the
             # existing graph. Exit before writing the manifest/marker below, which
             # would otherwise stamp these files as done and make the next
@@ -3556,23 +3691,17 @@ def dispatch_command(cmd: str) -> None:
                 f"pass failed) and the resulting graph is smaller than the existing "
                 f"{graph_json_path}. Refusing to overwrite a complete graph with a "
                 "partial one. Re-run after fixing the failures, or pass --allow-partial "
-                "to overwrite anyway.",
+                f"to overwrite anyway. ({_full_outcome.reason})",
                 file=sys.stderr,
             )
             sys.exit(1)
-        try:
-            # See the --no-cluster path above: persist the scan root so build_merge
-            # can relativize deleted-file paths under a custom --out (#2012/#1571).
-            (graphify_out / ".graphify_root").write_text(
-                str(Path(target).resolve()), encoding="utf-8"
+        if isinstance(_full_outcome, OperationFailed):
+            print(
+                f"[graphify extract] error: publication failed: {_full_outcome.reason}",
+                file=sys.stderr,
             )
-        except OSError:
-            pass
+            sys.exit(1)
         stages.mark("export")
-        if merged.get("output_tokens", 0) > 0:
-            (graphify_out / ".graphify_semantic_marker").write_text(
-                json.dumps({"output_tokens": merged["output_tokens"]}), encoding="utf-8"
-            )
         if global_merge:
             from graphify.global_graph import global_add as _global_add
             _tag = global_repo_tag or target.name
@@ -3585,23 +3714,25 @@ def dispatch_command(cmd: str) -> None:
                           f"(+{result['nodes_added']} nodes, -{result['nodes_removed']} pruned).")
             except Exception as exc:
                 print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
-        analysis = {
-            "communities": {str(k): v for k, v in communities.items()},
-            "cohesion": {str(k): v for k, v in cohesion.items()},
-            "gods": gods,
-            "surprises": surprises,
-            "tokens": {
-                "input": merged["input_tokens"],
-                "output": merged["output_tokens"],
-            },
-        }
-        from graphify.paths import write_json_atomic as _wja
-        _wja(analysis_path, analysis, indent=2)
-        try:
-            if has_path:
-                _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic)
-        except Exception as exc:
-            print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+        if has_path:
+            _manifest_outcome = _corpus_graph.full_extraction(
+                FullExtractionRequest(),
+                _publication=_Publication(
+                    manifest=_ManifestUpdate(
+                        files=_manifest_files,
+                        kind="both",
+                        root=target,
+                        scan_corpus=_scan_corpus,
+                        clear_semantic=_cleared_semantic,
+                    )
+                ),
+            )
+            if isinstance(_manifest_outcome, OperationFailed):
+                print(
+                    "[graphify extract] warning: could not write manifest: "
+                    f"{_manifest_outcome.reason}",
+                    file=sys.stderr,
+                )
 
         cost = _estimate_cost(backend, merged["input_tokens"], merged["output_tokens"])
         print(

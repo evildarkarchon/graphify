@@ -9,9 +9,11 @@ Use when you've added or modified files since the last run. Only re-extracts cha
 ```bash
 $(cat graphify-out/.graphify_python) -c "
 import sys, json
-from graphify.detect import detect_incremental, save_manifest
+from graphify.detect import detect_incremental
 from pathlib import Path
 
+update_marker = Path('graphify-out/.graphify_code_update')
+update_marker.unlink(missing_ok=True)
 result = detect_incremental(Path('INPUT_PATH'))
 new_total = result.get('new_total', 0)
 print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -57,6 +59,8 @@ code_exts = {'.py','.ts','.js','.go','.rs','.java','.cpp','.c','.rb','.swift','.
 new_files = result.get('new_files', {})
 all_changed = [f for files in new_files.values() for f in files]
 code_only = all(Path(f).suffix.lower() in code_exts for f in all_changed)
+update_marker = Path('graphify-out/.graphify_code_update')
+update_marker.write_text('1', encoding='utf-8') if code_only else update_marker.unlink(missing_ok=True)
 print('code_only:', code_only)
 "
 ```
@@ -87,7 +91,10 @@ $(cat graphify-out/.graphify_python) -c "
 import json
 from pathlib import Path
 from graphify.build import build_merge
-from graphify.detect import save_manifest
+from graphify.generation import (
+    CodeUpdateRequest, Corpus, CorpusGraph, FullExtractionRequest, OperationFailed,
+)
+from graphify.generation._publication import _ManifestUpdate, _Publication
 
 # Load new extraction and incremental state
 new_extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encoding=\"utf-8\"))
@@ -148,8 +155,8 @@ print(f'[graphify update] Merged extraction written ({len(merged_out[\"nodes\"])
 # merge overwrote the file): a changed doc whose chunk failed must stay unstamped
 # so the next --update re-queues it, otherwise it is marked done and its content
 # is lost forever (#2015). Mirrors the library extract path
-# (cli._stamped_manifest_files + clear_semantic + scan_corpus).
-from graphify.cli import _stamped_manifest_files
+# (generation._stamped_manifest_files + clear_semantic + scan_corpus).
+from graphify.generation._manifest import _stamped_manifest_files
 _manifest_files = _stamped_manifest_files(incremental['files'], new_extraction, Path('INPUT_PATH'))
 # Changed semantic files dispatched this run but NOT stamped had their chunk fail
 # or be omitted; clear any stale semantic_hash so they are re-queued (#1948).
@@ -160,7 +167,30 @@ _cleared = _dispatched - _stamped
 # scan_corpus = the RAW full corpus so in-root files newly excluded since last run
 # are dropped rather than masquerading as deletions; untouched rows preserved (#1908).
 _scan = {f for fl in incremental['files'].values() for f in fl}
-save_manifest(_manifest_files, root='INPUT_PATH', scan_corpus=_scan, clear_semantic=_cleared or None)
+owner = CorpusGraph(
+    Corpus(root=Path('INPUT_PATH').resolve(), output=Path('graphify-out'))
+)
+publication = _Publication(
+    manifest=_ManifestUpdate(
+        files=_manifest_files,
+        root=Path('INPUT_PATH'),
+        scan_corpus=_scan,
+        clear_semantic=_cleared or None,
+    ),
+)
+if Path('graphify-out/.graphify_code_update').exists():
+    outcome = owner.code_update(
+        CodeUpdateRequest(),
+        _publication=publication,
+    )
+else:
+    outcome = owner.full_extraction(
+        FullExtractionRequest(),
+        _publication=publication,
+    )
+if isinstance(outcome, OperationFailed):
+    print(f'[graphify update] Manifest publication failed: {outcome.reason}')
+    raise SystemExit(1)
 print('[graphify update] Manifest saved.')
 "
 ```

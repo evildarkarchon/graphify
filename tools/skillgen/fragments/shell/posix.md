@@ -31,7 +31,18 @@ fi
 mkdir -p graphify-out
 "$PYTHON" -c "import sys; open('graphify-out/.graphify_python', 'w', encoding='utf-8').write(sys.executable)"
 # Save scan root so `graphify update` (no args) knows where to look next time
-echo "$(cd INPUT_PATH && pwd)" > graphify-out/.graphify_root
+"$PYTHON" -c "
+from pathlib import Path
+from graphify.generation import Corpus, CorpusGraph, FullExtractionRequest, OperationFailed
+from graphify.generation._publication import _Publication
+root = Path('INPUT_PATH').resolve()
+outcome = CorpusGraph(Corpus(root=root, output=Path('graphify-out'))).full_extraction(
+    FullExtractionRequest(),
+    _publication=_Publication(root_marker=str(root)),
+)
+if isinstance(outcome, OperationFailed):
+    raise SystemExit(outcome.reason)
+" || exit 1
 ```
 
 If the import succeeds, print nothing and move straight to Step 2.

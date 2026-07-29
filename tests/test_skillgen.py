@@ -499,6 +499,13 @@ def test_monoliths_change_only_sanctioned_lines():
         assert UNIFIED_DESCRIPTION in rendered
 
 
+def test_generation_custody_does_not_globally_sanction_delimiters():
+    """Keep generic Python punctuation guarded outside CorpusGraph blocks."""
+    for line in (")", "),", "},"):
+        assert not gen._is_generation_custody_line(line)
+    assert not gen._is_generation_custody_line("print(CorpusGraph)")
+
+
 def test_monoliths_carry_the_1392_runbook_fixes():
     """The four #1392 data-loss/correctness fixes are present in both monoliths.
 
@@ -523,16 +530,20 @@ def test_monoliths_carry_the_1392_runbook_fixes():
         # #12 stale-cache unlink on a miss.
         assert ".graphify_cached.json').unlink(missing_ok=True)" in body
 
-        # #18/#20 zero-node guard before any write, report/analysis gated on
-        # to_json's return.
+        # #18/#20 zero-node guard before the owner accepts graph/report/analysis
+        # publication. CorpusGraph retains the established shrink refusal.
         lines = body.splitlines()
-        build_i = next(i for i, l in enumerate(lines) if "G = build_from_json(extraction, directed=IS_DIRECTED)" in l)
-        guard_i = next(i for i, l in enumerate(lines[build_i:], build_i) if "number_of_nodes() == 0" in l)
-        report_i = next(i for i, l in enumerate(lines[build_i:], build_i) if "GRAPH_REPORT.md').write_text(report)" in l)
-        wrote_i = next(i for i, l in enumerate(lines[build_i:], build_i) if l.strip().startswith("wrote = to_json("))
-        # guard fires right after the build, before the graph/report are written.
-        assert build_i < guard_i < wrote_i < report_i, f"[{key}] Step 4 ordering not fixed"
-        assert "if not wrote:" in body
+        step4_i = next(i for i, line in enumerate(lines) if "### Step 4 - Build graph" in line)
+        step5_i = next(i for i, line in enumerate(lines[step4_i:], step4_i) if "### Step 5 - Label" in line)
+        step4 = lines[step4_i:step5_i]
+        build_i = next(i for i, line in enumerate(step4) if "G = build_from_json(extraction, directed=IS_DIRECTED)" in line)
+        guard_i = next(i for i, line in enumerate(step4[build_i:], build_i) if "number_of_nodes() == 0" in line)
+        owner_i = next(i for i, line in enumerate(step4[build_i:], build_i) if "owner = CorpusGraph(" in line)
+        publication_i = next(i for i, line in enumerate(step4[owner_i:], owner_i) if "outcome = owner." in line)
+        # The guard fires immediately after build and before owner publication.
+        assert build_i < guard_i < owner_i < publication_i, f"[{key}] Step 4 ordering not fixed"
+        assert any("graph=_GraphModel(G, communities)" in line for line in step4)
+        assert any("if isinstance(outcome, PublicationRefused):" in line for line in step4)
 
 
 def test_monoliths_scope_semantic_cache_writes_to_uncached_files():
@@ -545,14 +556,13 @@ def test_monoliths_scope_semantic_cache_writes_to_uncached_files():
         assert "allowed_source_files=uncached" in body
 
 
-def test_generated_runbooks_pass_root_to_save_manifest():
-    """#1417: every save_manifest call in a shipped runbook threads root=.
+def test_generated_runbooks_pass_root_to_manifest_publication():
+    """#1417: every runbook manifest publication threads the scan root.
 
-    Without root=, save_manifest stores absolute path keys, so a clone or move
-    breaks --update (every cached file misses and the whole corpus re-extracts).
-    The full-build (skill.md / monoliths) and the --update reference all relativize
-    the manifest to the scan root via root='INPUT_PATH'. This guards the actual
-    shipped artifacts; --check keeps them in sync with the fragments.
+    Without ``root``, the manifest writer stores absolute keys, so a clone or
+    move breaks ``--update``. Runbooks now prepare ``_ManifestUpdate`` for
+    ``CorpusGraph`` instead of calling the writer directly; each payload must
+    retain ``Path('INPUT_PATH')``.
     """
     targets = [
         REPO_ROOT / "graphify" / "skill.md",
@@ -562,13 +572,18 @@ def test_generated_runbooks_pass_root_to_save_manifest():
     targets += sorted((REPO_ROOT / "graphify" / "skills").glob("*/references/update.md"))
     checked = 0
     for path in targets:
-        for ln in path.read_text(encoding="utf-8").splitlines():
-            if "save_manifest(" in ln and "import" not in ln:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if "manifest=_ManifestUpdate(" in line:
                 checked += 1
-                assert "root=" in ln, (
-                    f"{path.relative_to(REPO_ROOT)}: save_manifest without root= (#1417): {ln.strip()!r}"
+                payload = "\n".join(lines[index:index + 8])
+                assert "root=Path('INPUT_PATH')" in payload, (
+                    f"{path.relative_to(REPO_ROOT)}: manifest publication "
+                    "without the scan root (#1417)"
                 )
-    assert checked >= 4, f"expected save_manifest calls across the runbooks, found {checked}"
+    assert checked >= 4, (
+        f"expected manifest publications across the runbooks, found {checked}"
+    )
 
 
 def test_devin_keeps_its_multi_field_frontmatter():
