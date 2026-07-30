@@ -879,6 +879,81 @@ def _is_manifest_stamp_fix_line(line: str) -> bool:
     )
 
 
+def _is_generation_custody_line(line: str) -> bool:
+    """Whether a line routes a monolith publication through ``CorpusGraph``.
+
+    Issue #2 removes the monoliths' direct graph, report, analysis, label, and
+    manifest writers. The replacement keeps their extraction/clustering
+    algorithms and legacy Aider sidecar paths while handing every canonical
+    filesystem mutation to the generation owner.
+    """
+    stripped = line.strip()
+    custody_tokens = (
+        "graphify.generation",
+        "Corpus(root=",
+        "CodeUpdateRequest",
+        "FullExtractionRequest",
+        "ReclusteringRequest",
+        "PublicationRefused",
+        "OperationFailed",
+        "_CanonicalArtifact",
+        "_GraphModel",
+        "_ManifestUpdate",
+        "_Publication",
+        "artifact_paths=",
+        "graphify_code_update",
+        "needs_update=False",
+        "owner.code_update",
+        "owner.full_extraction",
+        "publication = _Publication",
+        "_publication=publication",
+        "protect_previous=",
+        "retire=frozenset",
+        "update_marker",
+        "outcome.reason",
+        "publication failed",
+    )
+    direct_writer_tokens = (
+        "from graphify.export import to_json",
+        "from graphify.detect import save_manifest",
+        "from graphify.detect import detect_incremental",
+        "Path('graphify-out/GRAPH_REPORT.md').write_text(report)",
+        "Path('graphify-out/.graphify_analysis.json').write_text(",
+        "Path('graphify-out/.graphify_labels.json').write_text(",
+        "Path('.graphify_analysis.json').write_text(",
+        "Path('.graphify_labels.json').write_text(",
+        "save_manifest(_manifest_files",
+        "rm -f .graphify_detect.json .graphify_extract.json .graphify_ast.json "
+        ".graphify_semantic.json .graphify_analysis.json .graphify_labels.json",
+        "rm -f graphify-out/.graphify_detect.json "
+        "graphify-out/.graphify_extract.json graphify-out/.graphify_ast.json "
+        "graphify-out/.graphify_semantic.json "
+        "graphify-out/.graphify_analysis.json "
+        "graphify-out/.graphify_labels.json",
+        "rm -f graphify-out/.needs_update",
+    )
+    structural_lines = {
+        ").full_extraction(",
+        ").reclustering(",
+        "graph=_GraphModel(G, communities),",
+        "report=report,",
+        "analysis=analysis,",
+        "labels={str(k): v for k, v in labels.items()},",
+        "manifest=_ManifestUpdate(",
+        "owner = CorpusGraph(",
+        "outcome = CorpusGraph(",
+        "files=_manifest_files,",
+        "root=Path('INPUT_PATH'),",
+        "scan_corpus=_scan,",
+        "clear_semantic=_cleared or None,",
+    }
+    return (
+        any(token in line for token in custody_tokens)
+        or any(token in line for token in direct_writer_tokens)
+        or stripped in structural_lines
+    )
+
+
 def _is_sensitive_reporting_fix_line(line: str) -> bool:
     """The #2106 change to how a non-empty ``skipped_sensitive`` is reported: the
     skill now lists the skipped file names instead of only a count, so a
@@ -968,6 +1043,7 @@ _SANCTIONED_MONOLITH_DIFFS = (
     _is_zero_node_guard_fix_line,
     _is_manifest_root_fix_line,
     _is_manifest_stamp_fix_line,
+    _is_generation_custody_line,
     _is_sensitive_reporting_fix_line,
     _is_no_api_key_fix_line,
     _is_shebang_allowlist_fix_line,
@@ -980,6 +1056,37 @@ _SANCTIONED_MONOLITH_DIFFS = (
 def _is_sanctioned_monolith_diff(line: str) -> bool:
     """Whether a single added/removed monolith line is an allowed change."""
     return not line.strip() or any(pred(line) for pred in _SANCTIONED_MONOLITH_DIFFS)
+
+
+def _generation_custody_delimiters(lines: list[str]) -> Counter[str]:
+    """Count structural delimiter lines inside owner-publication blocks only.
+
+    Bare closing delimiters are common Python and cannot be sanctioned globally
+    without weakening the pristine-monolith guard. Issue #2 adds them only
+    inside generation import groups and between a ``CorpusGraph(...)`` declaration
+    and its terminal outcome check, so the allowance is bounded to those custody
+    blocks.
+    """
+    delimiters = {")", "),", "},", "}),"}
+    allowed: Counter[str] = Counter()
+    in_custody_block = False
+    in_custody_import = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped in {
+            "from graphify.generation import (",
+            "from graphify.generation._publication import (",
+        }:
+            in_custody_import = True
+        if stripped in {"owner = CorpusGraph(", "outcome = CorpusGraph("}:
+            in_custody_block = True
+        if (in_custody_block or in_custody_import) and stripped in delimiters:
+            allowed[line] += 1
+        if in_custody_import and stripped == ")":
+            in_custody_import = False
+        if in_custody_block and stripped.startswith("if isinstance(outcome"):
+            in_custody_block = False
+    return allowed
 
 
 def monolith_roundtrip(platform: Platform) -> list[str]:
@@ -1014,9 +1121,19 @@ def monolith_roundtrip(platform: Platform) -> list[str]:
 
     added = Counter(rendered_lines) - Counter(original_lines)
     removed = Counter(original_lines) - Counter(rendered_lines)
+    custody_delimiters = _generation_custody_delimiters(rendered_lines)
 
     problems: list[str] = []
-    for line in list(added.elements()) + list(removed.elements()):
+    for line in added.elements():
+        if _is_sanctioned_monolith_diff(line):
+            continue
+        if custody_delimiters[line]:
+            custody_delimiters[line] -= 1
+            continue
+        problems.append(
+            f"[{platform.key}] unsanctioned monolith change vs pristine v8: {line!r}"
+        )
+    for line in removed.elements():
         if _is_sanctioned_monolith_diff(line):
             continue
         problems.append(

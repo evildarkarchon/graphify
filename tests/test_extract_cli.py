@@ -669,6 +669,9 @@ def test_missing_manifest_code_only_preserves_semantic_layer(monkeypatch, tmp_pa
 
     # 3) manifest goes missing (fresh clone / deliberately untracked)
     (graphify_out / "manifest.json").unlink()
+    # Direct compatibility mutation explicitly returns the fixture to legacy
+    # markerless state before the owner adopts it on the next operation.
+    (graphify_out / ".graphify_generation_complete").unlink(missing_ok=True)
 
     # 4) re-run the SAME code-only extract
     _run_extract(monkeypatch, ["graphify", "extract", str(corpus),
@@ -686,6 +689,7 @@ def test_missing_manifest_code_only_preserves_semantic_layer(monkeypatch, tmp_pa
     # 5) a genuine deletion still evicts the doc's semantic nodes
     (corpus / "README.md").unlink()
     (graphify_out / "manifest.json").unlink(missing_ok=True)
+    (graphify_out / ".graphify_generation_complete").unlink(missing_ok=True)
     _run_extract(monkeypatch, ["graphify", "extract", str(corpus),
                                "--code-only", "--out", str(out_dir)])
     gone = json.loads(graph_path.read_text())
@@ -850,6 +854,10 @@ def test_pathless_postgres_extract_initializes_empty_detection(
     (out_root / "graphify-out" / ".graphify_semantic_marker").write_text(
         '{"output_tokens": 1}'
     )
+    # This test deliberately mutates a canonical sidecar outside CorpusGraph.
+    (out_root / "graphify-out" / ".graphify_generation_complete").unlink(
+        missing_ok=True
+    )
 
     cache_entry = (
         out_root
@@ -962,6 +970,10 @@ def test_incremental_extract_prunes_newly_excluded_file_not_in_manifest(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest = {k: v for k, v in manifest.items() if "x.py" not in k}
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    # The fixture's direct manifest rewrite invalidates the completion marker.
+    (
+        out_dir / "graphify-out" / ".graphify_generation_complete"
+    ).unlink(missing_ok=True)
 
     (project / ".graphifyignore").write_text("x.py\n")
     _run_extract(

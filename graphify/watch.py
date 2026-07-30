@@ -81,10 +81,13 @@ def _write_build_config(
     *,
     excludes: "list[str] | None",
     gitignore: bool | None = None,
+    root: Path | None = None,
 ) -> None:
     """Persist corpus-shaping options under ``out_dir``.
 
     Best effort and non clobbering: omitted options retain their existing values.
+    Publication goes through ``CorpusGraph`` so build policy cannot become a
+    competing piece of canonical generation state.
     """
     if not excludes and gitignore is None:
         return
@@ -101,7 +104,15 @@ def _write_build_config(
             config["excludes"] = list(excludes)
         if gitignore is not None:
             config["gitignore"] = gitignore
-        path.write_text(json.dumps(config), encoding="utf-8")
+        from graphify.generation import Corpus, CorpusGraph, FullExtractionRequest
+        from graphify.generation._publication import _Publication
+
+        CorpusGraph(
+            Corpus(root=root or out_dir.parent, output=out_dir)
+        ).full_extraction(
+            FullExtractionRequest(),
+            _publication=_Publication(build_config=config),
+        )
     except OSError:
         pass
 
@@ -958,6 +969,21 @@ def _rebuild_code(
         from graphify.report import generate
         from graphify.export import to_json, to_html
         from graphify.security import check_graph_file_size_cap
+        from graphify.generation import (
+            CodeUpdateRequest,
+            Corpus,
+            CorpusGraph,
+            OperationFailed,
+            PublicationRefused,
+        )
+        from graphify.generation._publication import (
+            _GraphData,
+            _ManifestUpdate,
+            _Publication,
+        )
+
+        corpus_graph = CorpusGraph(Corpus(root=watch_root, output=out))
+        code_request = CodeUpdateRequest(tuple(changed_paths or ()))
 
         # Re-apply the excludes the initial extract recorded, so an update/watch/
         # hook rebuild does not silently re-include deliberately excluded paths
@@ -1179,7 +1205,6 @@ def _rebuild_code(
                 "nodes": _dedupe_nodes(result.get("nodes", [])),
                 "links": _dedupe_edges(result.get("edges", [])),
             }
-            candidate_graph_text = _json_text(candidate_graph_data)
             same_graph = False
             if existing_graph.exists():
                 try:
@@ -1211,35 +1236,41 @@ def _rebuild_code(
                     rebuilt_sources=rebuilt_sources,
                 ):
                     return False
-                from graphify.export import backup_if_protected as _backup
-                _backup(out)
-                # Atomic replace via tmp file, matching the clustered path: a
-                # crash mid-write must not leave a truncated graph.json.
-                graph_tmp = out / ".graph.tmp.json"
-                graph_tmp.write_text(candidate_graph_text, encoding="utf-8")
-                graph_tmp.replace(existing_graph)
+            publication = _Publication(
+                graph=(
+                    _GraphData(candidate_graph_data, force=True)
+                    if not same_graph
+                    else None
+                ),
+                # Advance the root marker only after the candidate graph has
+                # passed the existing shrink/readability guards.
+                root_marker=str(watch_path),
+                protect_previous=not same_graph,
+            )
+            outcome = corpus_graph.code_update(
+                code_request,
+                _publication=publication,
+            )
+            if isinstance(outcome, (PublicationRefused, OperationFailed)):
+                print(f"error: {outcome.reason}", file=sys.stderr)
+                return False
 
-            # Write the user-supplied path only after the candidate graph is
-            # accepted, so a refused shrink cannot mismatch graph and marker.
-            (out / ".graphify_root").write_text(str(watch_path), encoding="utf-8")
-
-            try:
-                from graphify.detect import save_manifest
-                # detected["files"] is a FULL detect of the watched root, so
-                # pass it as the scan corpus too: rows for files that left the
-                # scan but still exist on disk (newly excluded) are pruned
-                # instead of surviving as phantom "deleted" entries (#1908).
-                save_manifest(
-                    detected["files"], kind="ast", root=project_root,
-                    scan_corpus={f for _fl in detected["files"].values() for f in _fl},
-                )
-            except Exception:
-                pass
-
-            # clear stale needs_update flag if present
-            flag = out / "needs_update"
-            if flag.exists():
-                flag.unlink()
+            # Manifest and semantic-pending compatibility are best effort in the
+            # existing Code-update contract, but still publish through the owner.
+            corpus_graph.code_update(
+                code_request,
+                _publication=_Publication(
+                    manifest=_ManifestUpdate(
+                        files=detected["files"],
+                        kind="ast",
+                        root=project_root,
+                        scan_corpus={
+                            f for _fl in detected["files"].values() for f in _fl
+                        },
+                    ),
+                    needs_update=False,
+                ),
+            )
 
             if same_graph:
                 print("[graphify watch] No code-graph changes detected (--no-cluster); outputs left untouched.")
@@ -1269,18 +1300,24 @@ def _rebuild_code(
             except Exception:
                 same_topology = False
             if same_topology:
-                try:
-                    from graphify.detect import save_manifest
-                    # Full-scan save: prune excluded-but-alive rows (#1908).
-                    save_manifest(
-                        detected["files"], kind="ast", root=project_root,
-                        scan_corpus={f for _fl in detected["files"].values() for f in _fl},
-                    )
-                except Exception:
-                    pass
-                flag = out / "needs_update"
-                if flag.exists():
-                    flag.unlink()
+                # Full-scan save prunes excluded-but-alive rows (#1908). The
+                # compatibility projection is cleared by the same owner.
+                corpus_graph.code_update(
+                    code_request,
+                    _publication=_Publication(
+                        manifest=_ManifestUpdate(
+                            files=detected["files"],
+                            kind="ast",
+                            root=project_root,
+                            scan_corpus={
+                                f
+                                for _fl in detected["files"].values()
+                                for f in _fl
+                            },
+                        ),
+                        needs_update=False,
+                    ),
+                )
                 print("[graphify watch] No code-graph topology changes detected; outputs left untouched.")
                 return True
 
@@ -1354,7 +1391,6 @@ def _rebuild_code(
                           {"input": 0, "output": 0}, report_root, suggested_questions=questions,
                           built_at_commit=commit, learning=_llfr(out / "graph.json"))
         report_path = out / "GRAPH_REPORT.md"
-        labels_json = json.dumps({str(k): v for k, v in sorted(labels.items())}, ensure_ascii=False, indent=2) + "\n"
         graph_tmp = out / ".graph.tmp.json"
         json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit, community_labels=labels)
         if not json_written:
@@ -1393,6 +1429,7 @@ def _rebuild_code(
         if no_change:
             graph_tmp.unlink(missing_ok=True)
             print("[graphify watch] No code-graph changes detected; graph.json/GRAPH_REPORT.md left untouched.")
+            publication = _Publication(root_marker=str(watch_path))
         else:
             if not _check_shrink(
                 force, existing_graph_data, candidate_graph_data,
@@ -1401,29 +1438,45 @@ def _rebuild_code(
                 rebuilt_sources=rebuilt_sources,
             ):
                 return False
-            from graphify.export import backup_if_protected as _backup
-            _backup(out)
-            graph_tmp.replace(existing_graph)
-            report_path.write_text(report, encoding="utf-8")
-            labels_file.write_text(labels_json, encoding="utf-8")
-            # Keep the membership signatures in step with the labels we just wrote.
-            # Skipping this was the other half of the stale-label bug: labels.json
-            # advanced every rebuild while the sidecar kept describing an older
-            # clustering, so the guard above had nothing accurate to check against.
-            sig_file.write_text(
-                json.dumps({str(k): v for k, v in cur_sigs.items()}), encoding="utf-8")
-
-        (out / ".graphify_root").write_text(str(watch_path), encoding="utf-8")
-
-        try:
-            from graphify.detect import save_manifest
-            # Full-scan save: prune excluded-but-alive rows (#1908).
-            save_manifest(
-                detected["files"], kind="ast", root=project_root,
-                scan_corpus={f for _fl in detected["files"].values() for f in _fl},
+            publication = _Publication(
+                graph=_GraphData(candidate_graph_data, force=True),
+                report=report,
+                labels={str(k): v for k, v in sorted(labels.items())},
+                # Keep the membership signatures in step with the labels we
+                # publish. They are the evidence used to reject stale names
+                # after a later re-cluster.
+                label_signatures={str(k): v for k, v in cur_sigs.items()},
+                root_marker=str(watch_path),
+                protect_previous=True,
             )
-        except Exception:
-            pass
+
+        outcome = corpus_graph.code_update(
+            code_request,
+            _publication=publication,
+        )
+        graph_tmp.unlink(missing_ok=True)
+        if isinstance(outcome, (PublicationRefused, OperationFailed)):
+            print(f"error: {outcome.reason}", file=sys.stderr)
+            return False
+
+        # Full-scan save prunes excluded-but-alive rows (#1908). Manifest
+        # advancement and semantic-pending compatibility remain best effort,
+        # matching the established watcher contract, but the owner performs
+        # both publications.
+        corpus_graph.code_update(
+            code_request,
+            _publication=_Publication(
+                manifest=_ManifestUpdate(
+                    files=detected["files"],
+                    kind="ast",
+                    root=project_root,
+                    scan_corpus={
+                        f for _fl in detected["files"].values() for f in _fl
+                    },
+                ),
+                needs_update=False,
+            ),
+        )
 
         # to_html raises ValueError for graphs > the viz node limit.
         # Wrap so core outputs (graph.json + GRAPH_REPORT.md) always land.
@@ -1477,11 +1530,6 @@ def _rebuild_code(
             except Exception as cf_err:
                 print(f"[graphify watch] callflow HTML update skipped: {cf_err}")
 
-        # clear stale needs_update flag if present
-        flag = out / "needs_update"
-        if flag.exists():
-            flag.unlink()
-
         if not no_change:
             print(f"[graphify watch] Rebuilt: {G.number_of_nodes()} nodes, "
                   f"{G.number_of_edges()} edges, {len(communities)} communities")
@@ -1512,10 +1560,23 @@ def check_update(watch_path: Path) -> bool:
 
 
 def _notify_only(watch_path: Path) -> None:
-    """Write a flag file and print a notification (fallback for non-code-only corpora)."""
+    """Publish the semantic-update flag for a non-code-only Corpus."""
+    from graphify.generation import (
+        CodeUpdateRequest,
+        Corpus,
+        CorpusGraph,
+        OperationFailed,
+        PublicationRefused,
+    )
+    from graphify.generation._publication import _Publication
+
     flag = watch_path / _GRAPHIFY_OUT / "needs_update"
-    flag.parent.mkdir(parents=True, exist_ok=True)
-    flag.write_text("1", encoding="utf-8")
+    outcome = CorpusGraph(Corpus(root=watch_path.resolve(), output=flag.parent)).code_update(
+        CodeUpdateRequest(),
+        _publication=_Publication(needs_update=True),
+    )
+    if isinstance(outcome, (PublicationRefused, OperationFailed)):
+        raise RuntimeError(f"could not publish semantic-update flag: {outcome.reason}")
     print(f"\n[graphify watch] New or changed files detected in {watch_path}")
     print("[graphify watch] Non-code files changed - semantic re-extraction requires LLM.")
     print("[graphify watch] Run `/graphify --update` in Claude Code to update the graph.")

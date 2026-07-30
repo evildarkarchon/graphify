@@ -97,7 +97,18 @@ fi
 mkdir -p graphify-out
 "$PYTHON" -c "import sys; open('graphify-out/.graphify_python', 'w', encoding='utf-8').write(sys.executable)"
 # Save scan root so `graphify update` (no args) knows where to look next time
-echo "$(cd INPUT_PATH && pwd)" > graphify-out/.graphify_root
+"$PYTHON" -c "
+from pathlib import Path
+from graphify.generation import Corpus, CorpusGraph, FullExtractionRequest, OperationFailed
+from graphify.generation._publication import _Publication
+root = Path('INPUT_PATH').resolve()
+outcome = CorpusGraph(Corpus(root=root, output=Path('graphify-out'))).full_extraction(
+    FullExtractionRequest(),
+    _publication=_Publication(root_marker=str(root)),
+)
+if isinstance(outcome, OperationFailed):
+    raise SystemExit(outcome.reason)
+" || exit 1
 ```
 
 If the import succeeds, print nothing and move straight to Step 2.
@@ -111,6 +122,7 @@ $(cat graphify-out/.graphify_python) -c "
 import json
 from graphify.detect import detect
 from pathlib import Path
+Path('graphify-out/.graphify_code_update').unlink(missing_ok=True)
 result = detect(Path('INPUT_PATH'))
 print(json.dumps(result, ensure_ascii=False))
 " > graphify-out/.graphify_detect.json
@@ -399,7 +411,11 @@ from graphify.build import build_from_json
 from graphify.cluster import cluster, score_all
 from graphify.analyze import god_nodes, surprising_connections, suggest_questions
 from graphify.report import generate
-from graphify.export import to_json
+from graphify.generation import (
+    CodeUpdateRequest, Corpus, CorpusGraph, FullExtractionRequest, OperationFailed,
+    PublicationRefused,
+)
+from graphify.generation._publication import _GraphModel, _Publication
 from pathlib import Path
 
 extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encoding=\"utf-8\"))
@@ -423,17 +439,7 @@ labels = {cid: 'Community ' + str(cid) for cid in communities}
 # Placeholder questions - regenerated with real labels in Step 5
 questions = suggest_questions(G, communities, labels)
 
-# Export FIRST and honor the #479 shrink-guard: to_json returns False (writing
-# nothing) when the new graph is smaller than the existing graph.json. Only write
-# GRAPH_REPORT.md + the analysis sidecar when the graph was actually written, so
-# they never describe a graph that graph.json doesn't contain (#1392).
-wrote = to_json(G, communities, 'graphify-out/graph.json')
-if not wrote:
-    print('ERROR: refused to shrink graphify-out/graph.json (existing graph has more nodes; #479).')
-    print('If this shrink is intentional (you deleted files), re-run a full build with --force.')
-    raise SystemExit(1)
 report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, 'INPUT_PATH', suggested_questions=questions)
-Path('graphify-out/GRAPH_REPORT.md').write_text(report, encoding=\"utf-8\")
 analysis = {
     'communities': {str(k): v for k, v in communities.items()},
     'cohesion': {str(k): v for k, v in cohesion.items()},
@@ -441,7 +447,31 @@ analysis = {
     'surprises': surprises,
     'questions': questions,
 }
-Path('graphify-out/.graphify_analysis.json').write_text(json.dumps(analysis, indent=2, ensure_ascii=False), encoding=\"utf-8\")
+owner = CorpusGraph(
+    Corpus(root=Path('INPUT_PATH').resolve(), output=Path('graphify-out'))
+)
+publication = _Publication(
+    graph=_GraphModel(G, communities),
+    report=report,
+    analysis=analysis,
+)
+if Path('graphify-out/.graphify_code_update').exists():
+    outcome = owner.code_update(
+        CodeUpdateRequest(),
+        _publication=publication,
+    )
+else:
+    outcome = owner.full_extraction(
+        FullExtractionRequest(),
+        _publication=publication,
+    )
+if isinstance(outcome, PublicationRefused):
+    print('ERROR: refused to shrink graphify-out/graph.json (existing graph has more nodes; #479).')
+    print('If this shrink is intentional (you deleted files), re-run a full build with --force.')
+    raise SystemExit(1)
+if isinstance(outcome, OperationFailed):
+    print(f'ERROR: graph publication failed: {outcome.reason}')
+    raise SystemExit(1)
 print(f'Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges, {len(communities)} communities')
 "
 ```
@@ -489,6 +519,10 @@ from graphify.build import build_from_json
 from graphify.cluster import score_all
 from graphify.analyze import god_nodes, surprising_connections, suggest_questions
 from graphify.report import generate
+from graphify.generation import (
+    Corpus, CorpusGraph, OperationFailed, PublicationRefused, ReclusteringRequest,
+)
+from graphify.generation._publication import _Publication
 from pathlib import Path
 
 extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encoding=\"utf-8\"))
@@ -508,8 +542,18 @@ labels = LABELS_DICT
 questions = suggest_questions(G, communities, labels)
 
 report = generate(G, communities, cohesion, labels, analysis['gods'], analysis['surprises'], detection, tokens, 'INPUT_PATH', suggested_questions=questions)
-Path('graphify-out/GRAPH_REPORT.md').write_text(report, encoding=\"utf-8\")
-Path('graphify-out/.graphify_labels.json').write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding=\"utf-8\")
+outcome = CorpusGraph(
+    Corpus(root=Path('INPUT_PATH').resolve(), output=Path('graphify-out'))
+).reclustering(
+    ReclusteringRequest(),
+    _publication=_Publication(
+        report=report,
+        labels={str(k): v for k, v in labels.items()},
+    ),
+)
+if isinstance(outcome, (PublicationRefused, OperationFailed)):
+    print(f'ERROR: label publication failed: {outcome.reason}')
+    raise SystemExit(1)
 print('Report updated with community labels')
 "
 ```
@@ -550,7 +594,12 @@ $(cat graphify-out/.graphify_python) -c "
 import json
 from pathlib import Path
 from datetime import datetime, timezone
-from graphify.detect import save_manifest
+from graphify.generation import (
+    CodeUpdateRequest, Corpus, CorpusGraph, FullExtractionRequest, OperationFailed,
+)
+from graphify.generation._publication import (
+    _CanonicalArtifact, _ManifestUpdate, _Publication,
+)
 
 # Save manifest for --update
 detect = json.loads(Path('graphify-out/.graphify_detect.json').read_text(encoding=\"utf-8\"))
@@ -565,10 +614,10 @@ extract = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encod
 # a detected file whose chunk failed or was omitted must stay unstamped so the
 # next --update re-queues it, otherwise it is marked done and its content is lost
 # forever (#2015). This mirrors the library extract path exactly
-# (cli._stamped_manifest_files + clear_semantic + scan_corpus); do not stamp the
+# (generation._stamped_manifest_files + clear_semantic + scan_corpus); do not stamp the
 # raw corpus. Code files are always stamped (AST is deterministic); only semantic
 # types are gated on output.
-from graphify.cli import _stamped_manifest_files
+from graphify.generation._manifest import _stamped_manifest_files
 _corpus = detect.get('all_files') or detect['files']
 _manifest_files = _stamped_manifest_files(_corpus, extract, Path('INPUT_PATH'))
 # Files dispatched this run (the changed subset) but NOT stamped above still carry
@@ -582,7 +631,32 @@ _cleared = _dispatched - _stamped
 # files newly excluded since last run are dropped rather than masquerading as
 # deletions; untouched files' prior rows are still preserved (#1908).
 _scan = {f for fl in _corpus.values() for f in fl}
-save_manifest(_manifest_files, root='INPUT_PATH', scan_corpus=_scan, clear_semantic=_cleared or None)
+owner = CorpusGraph(
+    Corpus(root=Path('INPUT_PATH').resolve(), output=Path('graphify-out'))
+)
+publication = _Publication(
+    manifest=_ManifestUpdate(
+        files=_manifest_files,
+        root=Path('INPUT_PATH'),
+        scan_corpus=_scan,
+        clear_semantic=_cleared or None,
+    ),
+    needs_update=False,
+    retire=frozenset({_CanonicalArtifact.ANALYSIS}),
+)
+if Path('graphify-out/.graphify_code_update').exists():
+    outcome = owner.code_update(
+        CodeUpdateRequest(),
+        _publication=publication,
+    )
+else:
+    outcome = owner.full_extraction(
+        FullExtractionRequest(),
+        _publication=publication,
+    )
+if isinstance(outcome, OperationFailed):
+    print(f'ERROR: manifest publication failed: {outcome.reason}')
+    raise SystemExit(1)
 
 # Update cumulative cost tracker
 input_tok = extract.get('input_tokens', 0)
@@ -607,9 +681,8 @@ cost_path.write_text(json.dumps(cost, indent=2, ensure_ascii=False), encoding=\"
 print(f'This run: {input_tok:,} input tokens, {output_tok:,} output tokens')
 print(f'All time: {cost[\"total_input_tokens\"]:,} input, {cost[\"total_output_tokens\"]:,} output ({len(cost[\"runs\"])} runs)')
 "
-rm -f graphify-out/.graphify_detect.json graphify-out/.graphify_extract.json graphify-out/.graphify_ast.json graphify-out/.graphify_semantic.json graphify-out/.graphify_analysis.json
+rm -f graphify-out/.graphify_detect.json graphify-out/.graphify_extract.json graphify-out/.graphify_ast.json graphify-out/.graphify_semantic.json graphify-out/.graphify_code_update
 find graphify-out -maxdepth 1 -name '.graphify_chunk_*.json' -delete 2>/dev/null
-rm -f graphify-out/.needs_update 2>/dev/null || true
 ```
 
 Replace INPUT_PATH with the actual path (same value used in Steps 4-5) so the manifest is relativized to the scan root.

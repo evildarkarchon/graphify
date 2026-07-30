@@ -53,7 +53,19 @@ if (-not $GRAPHIFY_PYTHON) {
 # Save interpreter path — all subsequent steps read this
 $GRAPHIFY_PYTHON | Out-File -FilePath graphify-out\.graphify_python -Encoding utf8 -NoNewline
 # Save scan root so `graphify update` (no args) knows where to look next time
-(Resolve-Path INPUT_PATH).Path | Out-File -FilePath graphify-out\.graphify_root -Encoding utf8 -NoNewline
+& $GRAPHIFY_PYTHON -c "
+from pathlib import Path
+from graphify.generation import Corpus, CorpusGraph, FullExtractionRequest, OperationFailed
+from graphify.generation._publication import _Publication
+root = Path('INPUT_PATH').resolve()
+outcome = CorpusGraph(Corpus(root=root, output=Path('graphify-out'))).full_extraction(
+    FullExtractionRequest(),
+    _publication=_Publication(root_marker=str(root)),
+)
+if isinstance(outcome, OperationFailed):
+    raise SystemExit(outcome.reason)
+"
+if ($LASTEXITCODE -ne 0) { throw "graphify root publication failed" }
 ```
 
 If the import succeeds, print nothing and move straight to Step 2.

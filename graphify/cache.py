@@ -573,6 +573,31 @@ def cache_dir(root: Path = Path("."), kind: str = "ast",
     return d
 
 
+def _cache_payload_is_graph_evidence(result: object) -> bool:
+    """Return whether a cache payload satisfies the reusable evidence schema."""
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("nodes"), list)
+        or not isinstance(result.get("edges"), list)
+        or not isinstance(result.get("hyperedges", []), list)
+        or not isinstance(result.get("raw_calls", []), list)
+        or any(not isinstance(item, dict) for item in result.get("raw_calls", []))
+    ):
+        return False
+    from graphify.generation._contributions import _validate_graph_evidence
+
+    try:
+        _validate_graph_evidence(
+            result["nodes"],
+            result["edges"],
+            result.get("hyperedges", []),
+            description="cache payload",
+        )
+    except ValueError:
+        return False
+    return True
+
+
 def load_cached(path: Path, root: Path = Path("."), kind: str = "ast",
                 cache_root: Path | None = None, prompt: "str | Path | None" = None,
                 prompt_file: "str | Path | None" = None,
@@ -624,7 +649,20 @@ def load_cached(path: Path, root: Path = Path("."), kind: str = "ast",
     if entry.exists():
         try:
             result = json.loads(entry.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            warnings.warn(
+                f"ignoring corrupt cache entry {entry}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+        if not _cache_payload_is_graph_evidence(result):
+            warnings.warn(
+                f"ignoring corrupt cache entry {entry}: expected an object "
+                "containing valid node and edge evidence",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return None
         # A ``partial`` entry was produced from a truncated LLM response and
         # covers only part of the file's symbols. Serving it as authoritative
@@ -875,6 +913,44 @@ def check_semantic_cache(
             RuntimeWarning,
             stacklevel=2,
         )
+
+    if uncached:
+        location = Path(cache_root) if cache_root is not None else Path(root)
+        graphify_out = Path(_GRAPHIFY_OUT)
+        contribution_path = (
+            graphify_out
+            if graphify_out.is_absolute()
+            else location.resolve() / graphify_out
+        ) / ".graphify_contributions.jsonl"
+        if contribution_path.exists():
+            from graphify.generation._contributions import (
+                _relative_source_identity,
+                _semantic_contribution_sources,
+            )
+
+            try:
+                expected = _semantic_contribution_sources(contribution_path)
+            except (OSError, ValueError):
+                expected = set()
+            root_identity = Path(root).absolute()
+            missing_expected = 0
+            for value in uncached:
+                try:
+                    identity = _relative_source_identity(value, root_identity)
+                except (OSError, ValueError):
+                    continue
+                if identity in expected:
+                    missing_expected += 1
+            if missing_expected:
+                warnings.warn(
+                    f"{missing_expected} semantic cache entr"
+                    f"{'y' if missing_expected == 1 else 'ies'} expected from active "
+                    "Source contributions were unavailable; treating "
+                    f"{'it' if missing_expected == 1 else 'them'} as cache "
+                    "misses without changing the Corpus graph",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     return cached_nodes, cached_edges, cached_hyperedges, uncached
 
