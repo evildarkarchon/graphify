@@ -50,7 +50,7 @@ class CorpusGraph:
         """
         if not isinstance(request, FullExtractionRequest):
             raise TypeError("full_extraction requires FullExtractionRequest")
-        return self._complete(completion, _publication)
+        return self._complete(completion, _publication, operation="full-extraction")
 
     def code_update(
         self,
@@ -62,7 +62,7 @@ class CorpusGraph:
         """Publish the candidate prepared by the current Code update adapter."""
         if not isinstance(request, CodeUpdateRequest):
             raise TypeError("code_update requires CodeUpdateRequest")
-        return self._complete(completion, _publication)
+        return self._complete(completion, _publication, operation="code-update")
 
     def reclustering(
         self,
@@ -74,16 +74,18 @@ class CorpusGraph:
         """Publish the candidate prepared by Reclustering or label compatibility."""
         if not isinstance(request, ReclusteringRequest):
             raise TypeError("reclustering requires ReclusteringRequest")
-        return self._complete(completion, _publication)
+        return self._complete(completion, _publication, operation="reclustering")
 
     def _complete(
         self,
         completion: Completion,
         publication: _Publication | None,
+        *,
+        operation: str,
     ) -> TerminalOutcome:
         """Validate caller completion policy and synchronously publish a candidate."""
         if not isinstance(completion, (WaitUntilCovered, ReturnWhenQueued)):
             raise TypeError("completion must be WaitUntilCovered or ReturnWhenQueued")
         if publication is None:
             raise ValueError("the compatibility adapter did not prepare a publication")
-        return _Publisher(self._corpus).publish(publication)
+        return _Publisher(self._corpus).publish(publication, operation=operation)

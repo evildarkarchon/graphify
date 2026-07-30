@@ -23,6 +23,7 @@ from graphify.exporters.graphdb import push_to_falkordb, push_to_neo4j  # noqa: 
 # Artifacts worth preserving across rebuilds (non-regenerable without LLM or curation).
 _BACKUP_ARTIFACTS = [
     "graph.json",
+    ".graphify_contributions.jsonl",
     "GRAPH_REPORT.md",
     ".graphify_labels.json",
     ".graphify_analysis.json",

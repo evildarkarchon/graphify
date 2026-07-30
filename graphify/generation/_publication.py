@@ -7,6 +7,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
+from graphify.generation._contributions import _SourceContribution
+
 
 class _CanonicalArtifact(str, Enum):
     """Stable artifacts and compatibility projections owned by a Corpus graph."""
@@ -21,6 +23,7 @@ class _CanonicalArtifact(str, Enum):
     BUILD_CONFIG = ".graphify_build.json"
     SEMANTIC_MARKER = ".graphify_semantic_marker"
     NEEDS_UPDATE = "needs_update"
+    CONTRIBUTIONS = ".graphify_contributions.jsonl"
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,7 @@ class _Publication:
     """
 
     graph: _GraphData | _GraphModel | None = None
+    contributions: tuple[_SourceContribution, ...] | None = None
     report: str | None = None
     analysis: Mapping[str, Any] | None = None
     labels: Mapping[str, Any] | None = None

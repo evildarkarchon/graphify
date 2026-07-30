@@ -26,7 +26,12 @@ from pathlib import Path, PurePosixPath
 GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 
 
-def _atomic_replace(path: "str | Path", write_fn) -> None:
+def _atomic_replace(
+    path: "str | Path",
+    write_fn,
+    *,
+    newline: "str | None" = None,
+) -> None:
     """Atomically replace ``path`` with content written by ``write_fn(f)``.
 
     Writes a temp file in the SAME directory, then ``os.replace``s it into place
@@ -47,7 +52,7 @@ def _atomic_replace(path: "str | Path", write_fn) -> None:
     real.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=f".{real.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
             write_fn(f)
         # mkstemp creates the temp file 0600; match the destination's existing
         # mode (or the umask default for a new file) so an atomic replace never
