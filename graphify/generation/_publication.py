@@ -13,6 +13,7 @@ from graphify.generation._contributions import _SourceContribution
 class _CanonicalArtifact(str, Enum):
     """Stable artifacts and compatibility projections owned by a Corpus graph."""
 
+    COMPLETION = ".graphify_generation_complete"
     GRAPH = "graph.json"
     REPORT = "GRAPH_REPORT.md"
     ANALYSIS = ".graphify_analysis.json"

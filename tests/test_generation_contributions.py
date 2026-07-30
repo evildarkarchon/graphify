@@ -591,6 +591,7 @@ def test_reclustering_adopts_valid_legacy_graph_without_inventing_sidecars(
     assert graph_path.read_bytes() == original_graph_bytes
     assert {path.name for path in output.iterdir()} == {
         ".graphify_contributions.jsonl",
+        ".graphify_generation_complete",
         "graph.json",
     }
 

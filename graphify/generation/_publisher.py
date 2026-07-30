@@ -19,6 +19,7 @@ from graphify.generation._publication import (
     _GraphModel,
     _Publication,
 )
+from graphify.generation._transaction import _PublicationTransaction
 from graphify.generation._types import (
     AlreadyCurrent,
     Corpus,
@@ -38,13 +39,28 @@ class _Publisher:
         self._corpus = corpus
 
     def publish(self, publication: _Publication, *, operation: str) -> TerminalOutcome:
-        """Write one prepared publication through production writers."""
+        """Recover, validate, and transactionally publish one prepared generation.
+
+        Recovery precedes every stable-generation read. The method returns a
+        terminal refusal or failure without exposing an incomplete candidate;
+        successful promotion owns its journal from staging through cleanup.
+        """
+        recovery = _PublicationTransaction.recover(self._corpus)
+        if recovery is not None:
+            return recovery
         output = self._corpus.output
-        layout = _PublicationLayout(
+        requested_layout = _PublicationLayout(
             root=self._corpus.root,
             output=output,
             overrides=publication.artifact_paths,
         )
+        transaction = _PublicationTransaction(
+            self._corpus,
+            requested_layout,
+            operation=operation,
+            protect_previous=publication.protect_previous,
+        )
+        layout = transaction.layout
         graph_path = layout.path_for(_CanonicalArtifact.GRAPH)
         contribution_path = layout.path_for(_CanonicalArtifact.CONTRIBUTIONS)
         active_contributions = None
@@ -59,6 +75,7 @@ class _Publisher:
                 )
         prepared_contributions = None
         contributions_to_write = None
+        adopted_legacy_graph = False
         if publication.contributions is not None:
             prepared_contributions = _prepare_contributions(
                 publication.contributions,
@@ -80,6 +97,7 @@ class _Publisher:
             except (OSError, ValueError) as exc:
                 return PublicationRefused(str(exc))
             contributions_to_write = prepared_contributions
+            adopted_legacy_graph = True
         elif (
             prepared_contributions is None
             and graph is not None
@@ -96,6 +114,33 @@ class _Publisher:
             except ValueError as exc:
                 return PublicationRefused(str(exc))
             contributions_to_write = prepared_contributions
+            adopted_legacy_graph = True
+        elif (
+            prepared_contributions is None
+            and graph is None
+            and active_contributions is not None
+            and operation == "code-update"
+            and graph_path.exists()
+            and not transaction.active_generation_is_valid()
+        ):
+            if transaction.active_graph_matches_authoritative_contributions():
+                # Curated labels can stale the completion digest without
+                # changing Graph authority. Re-stage the exact ledger so the
+                # next marker preserves interpretation identity.
+                contributions_to_write = active_contributions
+            else:
+                try:
+                    # Watch compatibility can discover that graph.json already
+                    # has the desired topology after an external legacy write.
+                    # Re-adopt only when it no longer matches Source authority.
+                    prepared_contributions = _adopt_legacy_graph(
+                        graph_path,
+                        self._corpus.root,
+                    )
+                except (OSError, ValueError) as exc:
+                    return PublicationRefused(str(exc))
+                contributions_to_write = prepared_contributions
+                adopted_legacy_graph = True
         if prepared_contributions is not None:
             if (
                 publication.contributions is not None
@@ -115,23 +160,41 @@ class _Publisher:
         refusal = self._graph_refusal(graph, graph_path)
         if refusal is not None:
             return refusal
+        if graph is not None or adopted_legacy_graph:
+            transaction.replacing_graph()
+
+        if (
+            contributions_to_write is None
+            and graph is None
+            and publication.report is None
+            and publication.analysis is None
+            and publication.labels is None
+            and publication.label_signatures is None
+            and publication.manifest is None
+            and publication.root_marker is None
+            and publication.build_config is None
+            and publication.semantic_marker is None
+            and publication.needs_update is None
+            and not publication.retire
+        ):
+            return AlreadyCurrent()
 
         changed: list[str] = []
         try:
-            output.mkdir(parents=True, exist_ok=True)
-            if publication.protect_previous:
-                from graphify.export import backup_if_protected
-
-                backup_if_protected(output)
+            staged_layout = transaction.begin()
 
             if contributions_to_write is not None:
                 _write_contribution_ledger(
-                    contribution_path,
+                    staged_layout.path_for(_CanonicalArtifact.CONTRIBUTIONS),
                     contributions_to_write,
                 )
                 changed.append(_CanonicalArtifact.CONTRIBUTIONS.value)
             if graph is not None:
-                if not self._write_graph(graph, graph_path):
+                if not self._write_graph(
+                    graph,
+                    staged_layout.path_for(_CanonicalArtifact.GRAPH),
+                ):
+                    transaction.abort()
                     return PublicationRefused(
                         f"the established graph safety guard refused {graph_path}"
                     )
@@ -141,46 +204,46 @@ class _Publisher:
                     _CanonicalArtifact.REPORT,
                     publication.report,
                     changed,
-                    layout,
+                    staged_layout,
                 )
             self._write_json(
                 _CanonicalArtifact.ANALYSIS,
                 publication.analysis,
                 changed,
-                layout,
+                staged_layout,
                 indent=2,
             )
             self._write_json(
                 _CanonicalArtifact.LABELS,
                 publication.labels,
                 changed,
-                layout,
+                staged_layout,
                 indent=2,
             )
             self._write_json(
                 _CanonicalArtifact.LABEL_SIGNATURES,
                 publication.label_signatures,
                 changed,
-                layout,
+                staged_layout,
             )
             self._write_json(
                 _CanonicalArtifact.BUILD_CONFIG,
                 publication.build_config,
                 changed,
-                layout,
+                staged_layout,
             )
             self._write_json(
                 _CanonicalArtifact.SEMANTIC_MARKER,
                 publication.semantic_marker,
                 changed,
-                layout,
+                staged_layout,
             )
             if publication.root_marker is not None:
                 self._write_text(
                     _CanonicalArtifact.ROOT,
                     publication.root_marker,
                     changed,
-                    layout,
+                    staged_layout,
                 )
             if publication.manifest is not None:
                 from graphify.detect import save_manifest
@@ -188,7 +251,9 @@ class _Publisher:
                 update = publication.manifest
                 save_manifest(
                     dict(update.files),
-                    manifest_path=str(layout.path_for(_CanonicalArtifact.MANIFEST)),
+                    manifest_path=str(
+                        staged_layout.path_for(_CanonicalArtifact.MANIFEST)
+                    ),
                     kind=update.kind,
                     root=update.root,
                     scan_corpus=update.scan_corpus,
@@ -201,15 +266,29 @@ class _Publisher:
                         _CanonicalArtifact.NEEDS_UPDATE,
                         "1",
                         changed,
-                        layout,
+                        staged_layout,
                     )
                 else:
-                    self._retire(_CanonicalArtifact.NEEDS_UPDATE, changed, layout)
+                    self._retire(
+                        _CanonicalArtifact.NEEDS_UPDATE,
+                        changed,
+                        staged_layout,
+                    )
             for artifact in publication.retire:
-                self._retire(artifact, changed, layout)
+                self._retire(artifact, changed, staged_layout)
         except Exception as exc:
+            transaction.abort()
             return OperationFailed(str(exc))
 
+        if not changed:
+            transaction.abort()
+            return AlreadyCurrent()
+        refusal = transaction.prepare()
+        if refusal is not None:
+            return refusal
+        refusal = transaction.promote()
+        if refusal is not None:
+            return refusal
         if graph is not None:
             return GenerationPublished(tuple(changed))
         if changed:

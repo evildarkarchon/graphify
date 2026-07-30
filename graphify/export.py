@@ -33,7 +33,7 @@ _BACKUP_ARTIFACTS = [
 ]
 
 
-def backup_if_protected(out_dir: Path) -> "Path | None":
+def backup_if_protected(out_dir: Path, *, strict: bool = False) -> "Path | None":
     """Snapshot graph artifacts to a dated subfolder before an overwrite.
 
     Triggers when graph.json exists AND either:
@@ -41,11 +41,13 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
     - .graphify_labels.json contains at least one non-default community label
       (graph has been curated by a human or skill).
 
-    Returns the backup folder path, or None if no backup was taken.
-    Never raises — backup failure prints a warning but never blocks the write.
-    Set GRAPHIFY_NO_BACKUP=1 to disable.
+    Returns the backup folder path, or ``None`` if no backup was needed. The
+    compatibility default reports backup failures and continues; canonical
+    publication passes ``strict=True`` so a protected generation is never
+    overwritten without its backup. Set exactly ``GRAPHIFY_NO_BACKUP=1`` to
+    explicitly disable protection.
     """
-    if os.environ.get("GRAPHIFY_NO_BACKUP"):
+    if os.environ.get("GRAPHIFY_NO_BACKUP") == "1":
         return None
     out = Path(out_dir)
     if not (out / "graph.json").exists():
@@ -75,7 +77,7 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
     if backup_dir.exists() and (backup_dir / "graph.json").exists():
         src_hash = hashlib.sha256(graph_src.read_bytes()).hexdigest()
         bak_hash = hashlib.sha256((backup_dir / "graph.json").read_bytes()).hexdigest()
-        if src_hash == bak_hash:
+        if src_hash == bak_hash and not strict:
             return backup_dir  # identical content, nothing to do
 
     try:
@@ -87,12 +89,24 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
                 try:
                     shutil.copy2(src, backup_dir / name)
                     copied += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if strict:
+                        raise
+                    # Compatibility callers historically treat optional
+                    # sidecars as best effort, but the lost copy must remain
+                    # visible so users know the snapshot is incomplete.
+                    import sys
+
+                    print(
+                        f"[graphify] warning: backup skipped {name} ({exc})",
+                        file=sys.stderr,
+                    )
         if copied:
             print(f"[graphify] backed up {reason} graph ({copied} files) -> {backup_dir.name}/")
         return backup_dir
     except Exception as exc:
+        if strict:
+            raise OSError(f"protected backup failed: {exc}") from exc
         import sys
         print(f"[graphify] warning: backup failed ({exc}) - continuing with overwrite", file=sys.stderr)
         return None

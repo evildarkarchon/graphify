@@ -25,12 +25,23 @@ def _make_docs_corpus(tmp_path):
 def _seed_to_json_recorder(monkeypatch, *, returns=True):
     """Patch export.to_json to record the ``force`` it was called with and return
     a fixed bool (True = wrote, False = shrink guard refused)."""
+    from graphify.export import to_json as production_to_json
+
     rec = {"called": False, "force": None}
 
     def _stub(G, communities, output_path, *, force=False, **kwargs):
+        """Record policy while preserving production serialization on success."""
         rec["called"] = True
         rec["force"] = force
-        return returns
+        if not returns:
+            return False
+        return production_to_json(
+            G,
+            communities,
+            output_path,
+            force=True,
+            **kwargs,
+        )
 
     monkeypatch.setattr("graphify.export.to_json", _stub)
     return rec
