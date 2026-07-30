@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from graphify.generation._code_update import _execute_code_update
 from graphify.generation._publication import _Publication
 from graphify.generation._publisher import _Publisher
 from graphify.generation._types import (
@@ -59,10 +60,20 @@ class CorpusGraph:
         completion: Completion = WaitUntilCovered(),
         _publication: _Publication | None = None,
     ) -> TerminalOutcome:
-        """Publish the candidate prepared by the current Code update adapter."""
+        """Run one deterministic, LLM-free Code update for this Corpus.
+
+        Called without ``_publication`` this owns the whole operation:
+        authoritative discovery, structural extraction, reconciliation against
+        the active Source-contribution ledger, and publication. The
+        ``_publication`` handoff remains only for compatibility adapters that
+        have not yet been rerouted.
+        """
         if not isinstance(request, CodeUpdateRequest):
             raise TypeError("code_update requires CodeUpdateRequest")
-        return self._complete(completion, _publication, operation="code-update")
+        if _publication is not None:
+            return self._complete(completion, _publication, operation="code-update")
+        self._validate_completion(completion)
+        return _execute_code_update(self._corpus, request)
 
     def reclustering(
         self,
@@ -84,8 +95,13 @@ class CorpusGraph:
         operation: str,
     ) -> TerminalOutcome:
         """Validate caller completion policy and synchronously publish a candidate."""
-        if not isinstance(completion, (WaitUntilCovered, ReturnWhenQueued)):
-            raise TypeError("completion must be WaitUntilCovered or ReturnWhenQueued")
+        self._validate_completion(completion)
         if publication is None:
             raise ValueError("the compatibility adapter did not prepare a publication")
         return _Publisher(self._corpus).publish(publication, operation=operation)
+
+    @staticmethod
+    def _validate_completion(completion: Completion) -> None:
+        """Reject a completion policy outside the agreed closed union."""
+        if not isinstance(completion, (WaitUntilCovered, ReturnWhenQueued)):
+            raise TypeError("completion must be WaitUntilCovered or ReturnWhenQueued")

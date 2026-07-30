@@ -77,20 +77,40 @@ class _PublicationTransaction:
         self._candidate = self._workspace / "candidate"
         self._prior = self._workspace / "prior"
         self._placements = self._resolve_placements()
-        self._layout = _PublicationLayout(
-            root=self._corpus.root,
-            output=self._output,
-            overrides={
-                artifact: self._output.parent / artifact.value
-                for artifact in _PROMOTION_ORDER
-                if self._placements[artifact.value] == "compatibility-root"
-            },
-        )
+        self._layout = self._layout_for(corpus, self._placements)
 
     @property
     def layout(self) -> _PublicationLayout:
         """Return stable placements resolved from active and requested metadata."""
         return self._layout
+
+    @classmethod
+    def active_layout(cls, corpus: Corpus) -> _PublicationLayout:
+        """Return where the active generation's artifacts actually live.
+
+        Readers that inspect active state before staging anything — reconciling
+        an operation, for instance — must resolve the same placements the next
+        transaction will promote to. Reading ``output/<name>`` directly would
+        silently inspect the wrong file for any artifact a legacy runbook placed
+        beside ``graphify-out``.
+        """
+        return cls._layout_for(corpus, cls._active_marker_placements(corpus.output))
+
+    @staticmethod
+    def _layout_for(
+        corpus: Corpus,
+        placements: Mapping[str, str],
+    ) -> _PublicationLayout:
+        """Turn closed placement metadata into a resolvable artifact layout."""
+        return _PublicationLayout(
+            root=corpus.root,
+            output=corpus.output,
+            overrides={
+                artifact: corpus.output.parent / artifact.value
+                for artifact in _PROMOTION_ORDER
+                if placements.get(artifact.value) == "compatibility-root"
+            },
+        )
 
     def replacing_graph(self) -> None:
         """Authorize legacy-prior reconciliation before a graph replacement."""
@@ -347,7 +367,7 @@ class _PublicationTransaction:
             artifact.value: self._placement_for(artifact)
             for artifact in _PROMOTION_ORDER
         }
-        active = self._active_marker_placements()
+        active = self._active_marker_placements(self._output)
         for artifact in _PROMOTION_ORDER:
             if artifact not in self._requested_layout.overrides:
                 placements[artifact.value] = active.get(
@@ -356,9 +376,10 @@ class _PublicationTransaction:
                 )
         return placements
 
-    def _active_marker_placements(self) -> dict[str, str]:
+    @staticmethod
+    def _active_marker_placements(output: Path) -> dict[str, str]:
         """Read only closed placement metadata from the active completion marker."""
-        marker_path = self._output / _CanonicalArtifact.COMPLETION.value
+        marker_path = output / _CanonicalArtifact.COMPLETION.value
         try:
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
         except (OSError, TypeError, ValueError, json.JSONDecodeError):

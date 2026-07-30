@@ -38,6 +38,9 @@ scripts/benchmark_kimi*.json
 scripts/benchmark_kimi*.py
 paper/
 
+# Machine-local Claude Code instructions (loaded after CLAUDE.md, never shared)
+CLAUDE.local.md
+
 # macOS Finder metadata
 .DS_Store
 tests/fixtures/obj/Debug/net8.0/.NETCoreApp,Version=v8.0.AssemblyAttributes.cs

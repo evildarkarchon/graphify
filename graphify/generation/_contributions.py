@@ -10,6 +10,12 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterator, Mapping
 
 
+# Ledger key for legacy evidence no source attribution could be recovered for.
+# It is deliberately not a Corpus-relative path so it can never collide with a
+# real source, and it survives until a complete Full extraction replaces it.
+_UNATTRIBUTED_LEGACY_SOURCE = "@legacy/unattributed"
+
+
 class _InterpretationKind(str, Enum):
     """Identify how one Corpus source produced graph evidence."""
 
@@ -81,7 +87,13 @@ def _prepare_contributions(
     prepared: list[_PreparedContribution] = []
     seen: set[tuple[str, _InterpretationKind]] = set()
     for contribution in contributions:
-        source = _relative_source_identity(contribution.source, root)
+        # Reconciliation carries an existing unattributed legacy record forward
+        # verbatim; its key is intentionally not a Corpus-relative path.
+        source = (
+            _UNATTRIBUTED_LEGACY_SOURCE
+            if contribution.source == _UNATTRIBUTED_LEGACY_SOURCE
+            else _relative_source_identity(contribution.source, root)
+        )
         key = (source, contribution.interpretation)
         if key in seen:
             raise ValueError(
@@ -202,7 +214,7 @@ def _adopt_graph_payload(
             source=source,
             interpretation=(
                 _InterpretationKind.LEGACY_UNATTRIBUTED
-                if source == "@legacy/unattributed"
+                if source == _UNATTRIBUTED_LEGACY_SOURCE
                 else _InterpretationKind.LEGACY_ATTRIBUTED
             ),
             nodes=tuple(group["nodes"]),
@@ -223,7 +235,7 @@ def _prepare_legacy_contributions(
     prepared: list[_PreparedContribution] = []
     for contribution in contributions:
         source = str(contribution.source)
-        if source != "@legacy/unattributed":
+        if source != _UNATTRIBUTED_LEGACY_SOURCE:
             source = _relative_source_identity(source, root)
         prepared.append(
             _PreparedContribution(
@@ -261,11 +273,11 @@ def _prepare_legacy_contributions(
 def _legacy_source_identity(source: Any, root: Path) -> str:
     """Return a portable legacy attribution or the explicit unattributed key."""
     if not isinstance(source, str) or not source.strip():
-        return "@legacy/unattributed"
+        return _UNATTRIBUTED_LEGACY_SOURCE
     try:
         return _relative_source_identity(source, root)
     except (OSError, ValueError):
-        return "@legacy/unattributed"
+        return _UNATTRIBUTED_LEGACY_SOURCE
 
 
 def _portable_path(value: Path | str) -> Path:
@@ -339,11 +351,35 @@ def _portable_items(
 
 def _canonical_item_key(item: Mapping[str, Any]) -> str:
     """Return the deterministic ordering key used inside one source record."""
+    return _canonical_line(item)
+
+
+def _canonical_line(payload: Mapping[str, Any]) -> str:
+    """Encode one ledger line so identical evidence always yields identical bytes."""
     return json.dumps(
-        item,
+        payload,
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
+    )
+
+
+def _ledger_header_line() -> str:
+    """Return the encoded schema header every contribution ledger opens with."""
+    return _canonical_line({"schema": "graphify-source-contributions", "version": 1})
+
+
+def _ledger_record_line(contribution: _PreparedContribution) -> str:
+    """Return the encoded ledger line for one prepared Source contribution."""
+    return _canonical_line(
+        {
+            "source": contribution.source,
+            "interpretation": contribution.interpretation.value,
+            "provisional": contribution.provisional,
+            "nodes": list(contribution.nodes),
+            "edges": list(contribution.edges),
+            "hyperedges": list(contribution.hyperedges),
+        }
     )
 
 
@@ -354,41 +390,38 @@ def _write_contribution_ledger(
     """Atomically stream a deterministic JSON-lines contribution ledger."""
     from graphify.paths import _atomic_replace
 
-    header = {"schema": "graphify-source-contributions", "version": 1}
-
     def _write(handle) -> None:
-        handle.write(
-            json.dumps(
-                header,
-                sort_keys=True,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
+        handle.write(_ledger_header_line())
         handle.write("\n")
         for contribution in contributions:
-            record = {
-                "source": contribution.source,
-                "interpretation": contribution.interpretation.value,
-                "provisional": contribution.provisional,
-                "nodes": list(contribution.nodes),
-                "edges": list(contribution.edges),
-                "hyperedges": list(contribution.hyperedges),
-            }
-            handle.write(
-                json.dumps(
-                    record,
-                    sort_keys=True,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            )
+            handle.write(_ledger_record_line(contribution))
             handle.write("\n")
 
     # Required generation state must compare byte-for-byte across Windows and
     # POSIX, so disable the platform newline translation used by ordinary text
     # artifacts.
     _atomic_replace(path, _write, newline="\n")
+
+
+def _ledger_matches(
+    path: Path,
+    contributions: tuple[_PreparedContribution, ...],
+) -> bool:
+    """Return whether writing ``contributions`` would leave the ledger unchanged.
+
+    Compares line by line against the same encoder the writer uses, so the
+    ledger is never loaded whole just to answer whether it would change.
+    """
+    try:
+        with path.open("r", encoding="utf-8", newline="\n") as handle:
+            if handle.readline().rstrip("\n") != _ledger_header_line():
+                return False
+            for contribution in contributions:
+                if handle.readline().rstrip("\n") != _ledger_record_line(contribution):
+                    return False
+            return handle.readline() == ""
+    except OSError:
+        return False
 
 
 def _iter_contribution_ledger(path: Path) -> Iterator[_PreparedContribution]:

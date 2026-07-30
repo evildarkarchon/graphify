@@ -35,9 +35,16 @@ class FullExtractionRequest:
 
 @dataclass(frozen=True)
 class CodeUpdateRequest:
-    """Identify an LLM-free Code update operation."""
+    """Identify an LLM-free Code update operation.
+
+    ``changed_paths`` is an optimization hint only: authoritative discovery, not
+    the hint, decides which sources are live. ``force`` authorizes replacing the
+    active graph with a smaller one; it never weakens a fail-closed publication
+    rule.
+    """
 
     changed_paths: tuple[Path, ...] = ()
+    force: bool = False
 
 
 @dataclass(frozen=True)
