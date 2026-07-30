@@ -40,3 +40,12 @@ paper/
 
 # macOS Finder metadata
 .DS_Store
+tests/fixtures/obj/Debug/net8.0/.NETCoreApp,Version=v8.0.AssemblyAttributes.cs
+tests/fixtures/obj/Debug/net8.0/sample.AssemblyInfo.cs
+tests/fixtures/obj/Debug/net8.0/sample.AssemblyInfoInputs.cache
+tests/fixtures/obj/Debug/net8.0/sample.GeneratedMSBuildEditorConfig.editorconfig
+tests/fixtures/obj/Debug/net8.0/sample.GlobalUsings.g.cs
+tests/fixtures/xaml_viewmodel/obj/Debug/net8.0-windows/.NETCoreApp,Version=v8.0.AssemblyAttributes.cs
+tests/fixtures/xaml_viewmodel/obj/Debug/net8.0-windows/App.AssemblyInfo.cs
+tests/fixtures/xaml_viewmodel/obj/Debug/net8.0-windows/App.AssemblyInfoInputs.cache
+tests/fixtures/xaml_viewmodel/obj/Debug/net8.0-windows/App.GeneratedMSBuildEditorConfig.editorconfig
