@@ -902,7 +902,14 @@ def _is_generation_custody_line(line: str) -> bool:
         "_Publication",
         "artifact_paths=",
         "graphify_code_update",
-        "needs_update=False",
+        # Prefix only: the value is now conditional so a Code update cannot
+        # lower the pending marker, and this classifier must not depend on it.
+        "needs_update=",
+        "_is_code_update",
+        # The rationale comment that gates it, line by line (#6).
+        "pending marker",
+        "Stale semantic evidence",
+        "reinterpreted",
         "owner.code_update",
         "owner.full_extraction",
         "publication = _Publication",

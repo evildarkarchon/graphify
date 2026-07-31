@@ -128,6 +128,25 @@ def _plan_code_update(
             f"cannot validate authoritative Source contributions: {exc}"
         )
 
+    # kind="ast" is what keeps per-source semantic freshness truthful: the
+    # production manifest writer preserves a source's semantic_hash only while
+    # its content is unchanged, so a live source this operation could not
+    # reinterpret stays pending instead of being stamped as current.
+    manifest = _ManifestUpdate(
+        files=detection["files"],
+        kind="ast",
+        root=root,
+        scan_corpus={
+            path for group in detection["files"].values() for path in group
+        },
+    )
+    # Produced once, by the production manifest writer, and used for two
+    # decisions: whether Corpus state advances at all, and which sources this
+    # generation must disclose as awaiting reinterpretation. Deriving pending
+    # state from the manifest this operation is about to publish is what keeps
+    # the ledger and the manifest from encoding freshness differently.
+    prospective, manifest_changed = _prospective_manifest(layout, manifest)
+
     live = _live_source_identities(detection, root)
     # Evidence this operation cannot produce: interpreted meaning, and adopted
     # legacy evidence whose interpretation is unknown. A document carrying either
@@ -151,10 +170,28 @@ def _plan_code_update(
         if owned
         else {"nodes": [], "edges": [], "hyperedges": []}
     )
+    # A live source whose interpretation the prospective manifest can no longer
+    # vouch for is pending: its Semantic evidence still describes the source as
+    # it was before the change, so it is retained and disclosed as stale rather
+    # than dropped or silently presented as current.
+    from graphify.detect import manifest_records_current_interpretation
+
+    stale_semantic = {
+        contribution.source
+        for contribution in active
+        if contribution.interpretation is _InterpretationKind.SEMANTIC
+        and contribution.source in live
+        and not manifest_records_current_interpretation(
+            prospective,
+            contribution.source,
+        )
+    }
+
     contributions = _structural_contributions(result) + _preserved_contributions(
         active,
         live=live,
         rederived=frozenset(owned),
+        stale_semantic=stale_semantic,
     )
     prepared = _prepare_contributions(contributions, root)
     graph_data = _materialize_graph_data(prepared)
@@ -177,19 +214,6 @@ def _plan_code_update(
         layout.path_for(_CanonicalArtifact.CONTRIBUTIONS),
         prepared,
     )
-    # kind="ast" is what keeps per-source semantic freshness truthful: the
-    # production manifest writer preserves a source's semantic_hash only while
-    # its content is unchanged, so a live source this operation could not
-    # reinterpret stays pending instead of being stamped as current.
-    manifest = _ManifestUpdate(
-        files=detection["files"],
-        kind="ast",
-        root=root,
-        scan_corpus={
-            path for group in detection["files"].values() for path in group
-        },
-    )
-
     return _Publication(
         contributions=contributions if graph_changed else None,
         graph=(
@@ -208,9 +232,21 @@ def _plan_code_update(
             if graph_changed
             else None
         ),
-        manifest=manifest if _manifest_advances(layout, manifest) else None,
+        manifest=manifest if manifest_changed else None,
         root_marker=(
             str(root) if _root_marker_advances(layout, str(root)) else None
+        ),
+        # The compatibility pending marker is a projection of the state above,
+        # never an independent claim. A Code update may raise it, but it never
+        # lowers it: this operation performs no interpretation, so it can never
+        # be the evidence that a source stopped being pending.
+        needs_update=(
+            True
+            if stale_semantic
+            and not _pending_marker_is_raised(
+                layout.path_for(_CanonicalArtifact.NEEDS_UPDATE)
+            )
+            else None
         ),
         # Publishing graph evidence publishes a Raw graph generation, so the
         # clustered artifacts of the previous generation stop describing it and
@@ -278,14 +314,18 @@ def _active_evidence(
     return ()
 
 
-def _manifest_advances(layout: _PublicationLayout, update: _ManifestUpdate) -> bool:
-    """Return whether this discovery would change the active Corpus manifest.
+def _prospective_manifest(
+    layout: _PublicationLayout,
+    update: _ManifestUpdate,
+) -> tuple[dict[str, Any], bool]:
+    """Return the manifest this discovery would publish, and whether it advances.
 
     The manifest is the one canonical artifact the publisher recomputes from the
     live filesystem rather than receiving from a caller, so an identical result
     genuinely means Corpus state did not advance. The prospective manifest is
     produced by the production writer against a copy of the active one, so no
-    second encoding of manifest state exists to drift.
+    second encoding of manifest state — including per-source semantic freshness
+    — exists to drift from what publication will record.
     """
     import shutil
     import tempfile
@@ -306,7 +346,23 @@ def _manifest_advances(layout: _PublicationLayout, update: _ManifestUpdate) -> b
             scan_corpus=update.scan_corpus,
             clear_semantic=update.clear_semantic,
         )
-        return candidate.read_bytes() != active_bytes
+        candidate_bytes = candidate.read_bytes()
+    try:
+        prospective = json.loads(candidate_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        prospective = None
+    return (
+        prospective if isinstance(prospective, dict) else {},
+        candidate_bytes != active_bytes,
+    )
+
+
+def _pending_marker_is_raised(path: Path) -> bool:
+    """Return whether the compatibility pending marker already reads as raised."""
+    try:
+        return path.read_text(encoding="utf-8") == "1"
+    except (OSError, ValueError):
+        return False
 
 
 def _root_marker_advances(layout: _PublicationLayout, marker: str) -> bool:
@@ -375,6 +431,7 @@ def _preserved_contributions(
     *,
     live: set[str],
     rederived: frozenset[str],
+    stale_semantic: set[str],
 ) -> tuple[_SourceContribution, ...]:
     """Carry forward active evidence this Code update must not replace.
 
@@ -384,9 +441,12 @@ def _preserved_contributions(
     evidence either.
 
     Semantic evidence always survives for a live source, because Code update
-    never reinterprets. That is custody, not a freshness claim: whether a live
-    source's Semantic evidence is still current is recorded separately by the
-    manifest this operation publishes, so a changed source stays pending.
+    never reinterprets. That is custody, not a freshness claim: a source in
+    ``stale_semantic`` keeps its evidence carrying an explicit stale marking, so
+    the generation states plainly that the interpretation predates the file it
+    describes. The marking is re-derived every run from the manifest this
+    operation publishes, so it clears exactly when a Full extraction has proven
+    the interpretation current again — never because a Code update ran.
 
     Provisional legacy evidence is replaced per source once real extraction
     covers it, while unattributed legacy evidence survives until a complete Full
@@ -403,12 +463,23 @@ def _preserved_contributions(
             continue
         if contribution.provisional and contribution.source in rederived:
             continue
-        preserved.append(_as_source_contribution(contribution))
+        preserved.append(
+            _as_source_contribution(
+                contribution,
+                stale=(
+                    contribution.source in stale_semantic
+                    if contribution.interpretation is _InterpretationKind.SEMANTIC
+                    else contribution.stale
+                ),
+            )
+        )
     return tuple(preserved)
 
 
 def _as_source_contribution(
     contribution: _PreparedContribution,
+    *,
+    stale: bool | None = None,
 ) -> _SourceContribution:
     """Return one validated ledger record as a publishable contribution."""
     return _SourceContribution(
@@ -418,6 +489,7 @@ def _as_source_contribution(
         edges=contribution.edges,
         hyperedges=contribution.hyperedges,
         provisional=contribution.provisional,
+        stale=contribution.stale if stale is None else stale,
     )
 
 

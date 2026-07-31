@@ -1255,8 +1255,11 @@ def _rebuild_code(
                 print(f"error: {outcome.reason}", file=sys.stderr)
                 return False
 
-            # Manifest and semantic-pending compatibility are best effort in the
-            # existing Code-update contract, but still publish through the owner.
+            # Manifest compatibility is best effort in the existing Code-update
+            # contract, but still publishes through the owner. The pending
+            # marker is deliberately untouched: this rebuild interprets nothing,
+            # so it cannot be the evidence that a semantic source stopped
+            # needing reinterpretation.
             corpus_graph.code_update(
                 code_request,
                 _publication=_Publication(
@@ -1268,7 +1271,6 @@ def _rebuild_code(
                             f for _fl in detected["files"].values() for f in _fl
                         },
                     ),
-                    needs_update=False,
                 ),
             )
 
@@ -1301,7 +1303,9 @@ def _rebuild_code(
                 same_topology = False
             if same_topology:
                 # Full-scan save prunes excluded-but-alive rows (#1908). The
-                # compatibility projection is cleared by the same owner.
+                # pending marker stays as published: an unchanged code topology
+                # says nothing about whether a semantic source awaits
+                # reinterpretation.
                 corpus_graph.code_update(
                     code_request,
                     _publication=_Publication(
@@ -1315,7 +1319,6 @@ def _rebuild_code(
                                 for f in _fl
                             },
                         ),
-                        needs_update=False,
                     ),
                 )
                 print("[graphify watch] No code-graph topology changes detected; outputs left untouched.")
@@ -1387,9 +1390,11 @@ def _rebuild_code(
             )
         questions = suggest_questions(G, communities, labels)
         from graphify.report import load_learning_for_report as _llfr
+        from graphify.report import load_stale_semantic_sources as _lsss
         report = generate(G, communities, cohesion, labels, gods, surprises, detection,
                           {"input": 0, "output": 0}, report_root, suggested_questions=questions,
-                          built_at_commit=commit, learning=_llfr(out / "graph.json"))
+                          built_at_commit=commit, learning=_llfr(out / "graph.json"),
+                          stale_semantic_sources=_lsss(out / "graph.json"))
         report_path = out / "GRAPH_REPORT.md"
         graph_tmp = out / ".graph.tmp.json"
         json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit, community_labels=labels)
@@ -1460,9 +1465,11 @@ def _rebuild_code(
             return False
 
         # Full-scan save prunes excluded-but-alive rows (#1908). Manifest
-        # advancement and semantic-pending compatibility remain best effort,
-        # matching the established watcher contract, but the owner performs
-        # both publications.
+        # advancement remains best effort, matching the established watcher
+        # contract, but the owner performs the publication. The pending marker
+        # is left alone: an LLM-free rebuild has no evidence that a changed
+        # semantic source was reinterpreted, and clearing it here would present
+        # Stale semantic evidence as current.
         corpus_graph.code_update(
             code_request,
             _publication=_Publication(
@@ -1474,7 +1481,6 @@ def _rebuild_code(
                         f for _fl in detected["files"].values() for f in _fl
                     },
                 ),
-                needs_update=False,
             ),
         )
 

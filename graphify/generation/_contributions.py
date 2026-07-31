@@ -27,7 +27,13 @@ class _InterpretationKind(str, Enum):
 
 @dataclass(frozen=True)
 class _SourceContribution:
-    """Carry one source's evidence before graph-wide deduplication."""
+    """Carry one source's evidence before graph-wide deduplication.
+
+    ``stale`` records that the live source has changed since this evidence was
+    interpreted. It is custody metadata, not a quality judgement: the evidence
+    remains authoritative and queryable until a successful reinterpretation
+    replaces it.
+    """
 
     source: Path | str
     interpretation: _InterpretationKind
@@ -35,6 +41,7 @@ class _SourceContribution:
     edges: tuple[Mapping[str, Any], ...] = ()
     hyperedges: tuple[Mapping[str, Any], ...] = ()
     provisional: bool = False
+    stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,7 @@ class _PreparedContribution:
     edges: tuple[dict[str, Any], ...]
     hyperedges: tuple[dict[str, Any], ...]
     provisional: bool
+    stale: bool = False
 
 
 def _validate_graph_evidence(
@@ -118,6 +126,7 @@ def _prepare_contributions(
                 edges=_portable_items(contribution.edges, root),
                 hyperedges=_portable_items(contribution.hyperedges, root),
                 provisional=contribution.provisional,
+                stale=contribution.stale,
             )
         )
     return tuple(
@@ -370,17 +379,24 @@ def _ledger_header_line() -> str:
 
 
 def _ledger_record_line(contribution: _PreparedContribution) -> str:
-    """Return the encoded ledger line for one prepared Source contribution."""
-    return _canonical_line(
-        {
-            "source": contribution.source,
-            "interpretation": contribution.interpretation.value,
-            "provisional": contribution.provisional,
-            "nodes": list(contribution.nodes),
-            "edges": list(contribution.edges),
-            "hyperedges": list(contribution.hyperedges),
-        }
-    )
+    """Return the encoded ledger line for one prepared Source contribution.
+
+    ``stale`` is written only when true. The encoding stays a pure function of
+    the record, so comparison remains deterministic, and a generation with no
+    stale evidence keeps the byte-for-byte ledger earlier versions produced —
+    which is what lets an existing Corpus adopt this field without a rewrite.
+    """
+    record: dict[str, Any] = {
+        "source": contribution.source,
+        "interpretation": contribution.interpretation.value,
+        "provisional": contribution.provisional,
+        "nodes": list(contribution.nodes),
+        "edges": list(contribution.edges),
+        "hyperedges": list(contribution.hyperedges),
+    }
+    if contribution.stale:
+        record["stale"] = True
+    return _canonical_line(record)
 
 
 def _write_contribution_ledger(
@@ -457,6 +473,11 @@ def _iter_contribution_ledger(path: Path) -> Iterator[_PreparedContribution]:
                 nodes = record["nodes"]
                 edges = record["edges"]
                 hyperedges = record["hyperedges"]
+                # Absent in ledgers written before per-source semantic freshness
+                # existed. Those generations recorded no staleness at all, so
+                # reading the omission as "not stale" is the truthful default
+                # and keeps a pre-existing Corpus readable.
+                stale = record.get("stale", False)
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"invalid Source-contribution record at {path}:{line_number}"
@@ -465,6 +486,7 @@ def _iter_contribution_ledger(path: Path) -> Iterator[_PreparedContribution]:
                 not isinstance(source, str)
                 or not _source_identity_is_portable(source)
                 or not isinstance(provisional, bool)
+                or not isinstance(stale, bool)
                 or not all(isinstance(bucket, list) for bucket in (nodes, edges, hyperedges))
             ):
                 raise ValueError(
@@ -502,6 +524,7 @@ def _iter_contribution_ledger(path: Path) -> Iterator[_PreparedContribution]:
                 edges=tuple(edges),
                 hyperedges=tuple(hyperedges),
                 provisional=provisional,
+                stale=stale,
             )
 
 
@@ -535,6 +558,22 @@ def _semantic_contribution_sources(path: Path) -> set[str]:
         for contribution in _iter_contribution_ledger(path)
         if contribution.interpretation is _InterpretationKind.SEMANTIC
     }
+
+
+def _stale_semantic_sources(path: Path) -> tuple[str, ...]:
+    """Return the sorted sources whose Semantic evidence is disclosed as stale.
+
+    Streams the ledger rather than materializing it: disclosure runs on every
+    read path, and only the source identities are needed.
+    """
+    return tuple(
+        sorted(
+            contribution.source
+            for contribution in _iter_contribution_ledger(path)
+            if contribution.interpretation is _InterpretationKind.SEMANTIC
+            and contribution.stale
+        )
+    )
 
 
 def _dedupe_hyperedges(hyperedges: list[dict[str, Any]]) -> list[dict[str, Any]]:

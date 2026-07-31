@@ -1741,6 +1741,28 @@ def save_manifest(
     write_json_atomic(manifest_path, manifest, indent=2)
 
 
+def manifest_records_current_interpretation(manifest: dict, source: str) -> bool:
+    """Whether ``manifest`` still vouches for ``source``'s semantic extraction.
+
+    A non-empty ``semantic_hash`` is this module's record that a file's content
+    is unchanged since it was last interpreted — the same rule ``save_manifest``
+    applies when it decides whether to carry that hash forward. Readers asking
+    "is this source's interpretation still current?" use this instead of
+    re-deriving the manifest row shape, which would let the two drift.
+
+    ``source`` is looked up in both its given and NFC-normalized spelling,
+    because manifest keys are stored NFC while scan paths may arrive NFD
+    (#2221). An absent row, a legacy row shape, or a cleared hash all answer
+    False: none of them proves the interpretation still describes the file.
+    """
+    entry = manifest.get(source)
+    if entry is None:
+        entry = manifest.get(_nfc(source))
+    if not isinstance(entry, dict):
+        return False
+    return bool(entry.get("semantic_hash"))
+
+
 def detect_incremental(
     root: Path,
     manifest_path: str = _MANIFEST_PATH,

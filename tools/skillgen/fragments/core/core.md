@@ -558,6 +558,7 @@ _scan = {f for fl in _corpus.values() for f in fl}
 owner = CorpusGraph(
     Corpus(root=Path('INPUT_PATH').resolve(), output=Path('graphify-out'))
 )
+_is_code_update = Path('graphify-out/.graphify_code_update').exists()
 publication = _Publication(
     manifest=_ManifestUpdate(
         files=_manifest_files,
@@ -565,10 +566,13 @@ publication = _Publication(
         scan_corpus=_scan,
         clear_semantic=_cleared or None,
     ),
-    needs_update=False,
+    # Only a completed semantic extraction may lower the pending marker. A Code
+    # update interprets nothing, so it leaves Stale semantic evidence disclosed
+    # rather than claiming those sources were reinterpreted.
+    needs_update=None if _is_code_update else False,
     retire=frozenset({_CanonicalArtifact.ANALYSIS}),
 )
-if Path('graphify-out/.graphify_code_update').exists():
+if _is_code_update:
     outcome = owner.code_update(
         CodeUpdateRequest(),
         _publication=publication,

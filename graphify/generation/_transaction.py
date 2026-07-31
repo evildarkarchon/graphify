@@ -77,7 +77,11 @@ class _PublicationTransaction:
         self._candidate = self._workspace / "candidate"
         self._prior = self._workspace / "prior"
         self._placements = self._resolve_placements()
-        self._layout = self._layout_for(corpus, self._placements)
+        self._layout = self._layout_for(
+            corpus.root,
+            corpus.output,
+            self._placements,
+        )
 
     @property
     def layout(self) -> _PublicationLayout:
@@ -94,19 +98,43 @@ class _PublicationTransaction:
         silently inspect the wrong file for any artifact a legacy runbook placed
         beside ``graphify-out``.
         """
-        return cls._layout_for(corpus, cls._active_marker_placements(corpus.output))
+        return cls._layout_for(
+            corpus.root,
+            corpus.output,
+            cls._active_marker_placements(corpus.output),
+        )
+
+    @classmethod
+    def active_artifact_path(
+        cls,
+        output: Path,
+        artifact: _CanonicalArtifact,
+    ) -> Path:
+        """Resolve one active artifact's location from the output alone.
+
+        A read-only disclosure reader knows where a Corpus publishes but has no
+        business inventing its source root, and placement resolution never needs
+        one. Naming the output as the layout root keeps that honest: the value is
+        unused for path resolution and no caller can mistake it for the Corpus.
+        """
+        return cls._layout_for(
+            output,
+            output,
+            cls._active_marker_placements(output),
+        ).path_for(artifact)
 
     @staticmethod
     def _layout_for(
-        corpus: Corpus,
+        root: Path,
+        output: Path,
         placements: Mapping[str, str],
     ) -> _PublicationLayout:
         """Turn closed placement metadata into a resolvable artifact layout."""
         return _PublicationLayout(
-            root=corpus.root,
-            output=corpus.output,
+            root=root,
+            output=output,
             overrides={
-                artifact: corpus.output.parent / artifact.value
+                artifact: output.parent / artifact.value
                 for artifact in _PROMOTION_ORDER
                 if placements.get(artifact.value) == "compatibility-root"
             },

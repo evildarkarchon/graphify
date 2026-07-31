@@ -45,9 +45,12 @@ _READ_NUDGE_STALE = json.dumps({
         "hookEventName": "PreToolUse",
         "additionalContext": (
             'graphify-out/graph.json exists but may be STALE for this file (the file '
-            'changed after the last build). Prefer `graphify query "<question>"` for '
-            'orientation, and run `graphify update` to refresh the graph. Reading the '
-            'file directly is fine.'
+            'changed after the last build, or a semantic source is awaiting '
+            'reinterpretation). Prefer `graphify query "<question>"` for orientation — '
+            'it names any source carrying Stale semantic evidence. Run `graphify '
+            'update` to refresh code structure; docs, papers, and images need '
+            '`/graphify --update`, which `graphify update` cannot do. Reading the file '
+            'directly is fine.'
         ),
     }
 }, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -83,6 +86,36 @@ _GEMINI_NUDGE_TEXT = (
 
 def _default_graph_path() -> str:
     return str(Path(_GRAPHIFY_OUT) / "graph.json")
+
+
+def _disclose_stale_semantic_evidence(graph_path: Path) -> None:
+    """Announce Stale semantic evidence before a reader renders graph content.
+
+    A reader that shows interpreted evidence without saying it predates the file
+    it describes lets an answer read as current. The disclosure is derived from
+    the active generation's Source-contribution ledger through the owning
+    module, and it heads the output so a truncated or piped answer still carries
+    it. Silent when the generation is current, unreadable, or has no ledger, so
+    no reader can fail because of a disclosure.
+    """
+    try:
+        from graphify.generation import (
+            stale_semantic_disclosure,
+            stale_semantic_sources,
+        )
+        from graphify.security import sanitize_label
+
+        sources = stale_semantic_sources(graph_path.parent)
+        # Ledger identities are validated as portable relative paths, but they
+        # still reach a terminal as text, so they go through the same label
+        # sanitizer every other rendered graph value does.
+        disclosure = stale_semantic_disclosure(
+            [sanitize_label(source) for source in sources]
+        )
+    except Exception:
+        return
+    if disclosure:
+        print(f"[!] STALE SEMANTIC EVIDENCE: {disclosure}\n")
 
 
 def _stale_graph_sources(
@@ -921,6 +954,7 @@ def dispatch_command(cmd: str) -> None:
             duration_ms=(_time.perf_counter() - _t0) * 1000,
         )
         _touch_query_stamp(gp)
+        _disclose_stale_semantic_evidence(gp)
         print(_result)
     elif cmd == "affected":
         if len(sys.argv) < 3:
@@ -1162,6 +1196,9 @@ def dispatch_command(cmd: str) -> None:
             G = json_graph.node_link_graph(_raw, edges="links")
         except TypeError:
             G = json_graph.node_link_graph(_raw)
+        # Ahead of every early exit below: "no path found" is itself an answer
+        # the reader can misread as settled when part of the graph is stale.
+        _disclose_stale_semantic_evidence(gp)
         src_scored = _score_nodes(G, [t.lower() for t in source_label.split()])
         tgt_scored = _score_nodes(G, [t.lower() for t in target_label.split()])
         if not src_scored:
@@ -1272,6 +1309,7 @@ def dispatch_command(cmd: str) -> None:
             G = json_graph.node_link_graph(_raw, edges="links")
         except TypeError:
             G = json_graph.node_link_graph(_raw)
+        _disclose_stale_semantic_evidence(gp)
         matches = _find_node(G, label)
         if not matches:
             print(f"No node matching '{label}' found.")
@@ -1767,11 +1805,13 @@ def dispatch_command(cmd: str) -> None:
         from graphify.export import _git_head as _gh
         _commit = _gh()
         from graphify.report import load_learning_for_report as _llfr
+        from graphify.report import load_stale_semantic_sources as _lsss
         report = generate(G, communities, cohesion, labels, gods, surprises,
                           {"warning": "cluster-only mode — file stats not available"},
                           tokens, str(watch_path), suggested_questions=questions,
                           min_community_size=min_community_size, built_at_commit=_commit,
-                          learning=_llfr(out / "graph.json"))
+                          learning=_llfr(out / "graph.json"),
+                          stale_semantic_sources=_lsss(out / "graph.json"))
         analysis = {
             "communities": {str(k): v for k, v in communities.items()},
             "cohesion": {str(k): v for k, v in cohesion.items()},

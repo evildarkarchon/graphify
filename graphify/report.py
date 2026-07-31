@@ -68,6 +68,44 @@ def _learning_section(lines: list, learning: dict | None, top_n: int = 10) -> No
                          + (f" -> {nodes}" if nodes else ""))
 
 
+def load_stale_semantic_sources(graph_path) -> list[str]:
+    """Return the sources whose Semantic evidence the active generation calls stale.
+
+    Reads the Source-contribution ledger that sits beside ``graph_path`` through
+    the owning generation module, so the report discloses exactly the freshness
+    the published generation recorded. Best-effort: an unreadable or absent
+    ledger simply omits the section.
+    """
+    from pathlib import Path as _Path
+    try:
+        from graphify.generation import stale_semantic_sources
+        return list(stale_semantic_sources(_Path(graph_path).parent))
+    except Exception:
+        return []
+
+
+def _semantic_freshness_section(lines: list, stale_sources: list[str] | None) -> None:
+    """Append the ``## Semantic Freshness`` disclosure, or nothing when current.
+
+    The wording comes from the owning generation module so the report and the
+    query readers describe the same state identically. Omitting the section for
+    a fully current generation keeps the report byte-identical to one produced
+    before per-source freshness was tracked.
+    """
+    if not stale_sources:
+        return
+    from graphify.generation import stale_semantic_disclosure
+
+    lines += [
+        "",
+        "## Semantic Freshness",
+        # A report is read whole rather than skimmed in a terminal, so it names
+        # more of the pending sources than the one-line query banner does.
+        f"- **Stale semantic evidence.** "
+        f"{stale_semantic_disclosure(stale_sources, limit=20)}",
+    ]
+
+
 def generate(
     G: nx.Graph,
     communities: dict[int, list[str]],
@@ -83,6 +121,7 @@ def generate(
     built_at_commit: str | None = None,
     learning: dict | None = None,
     obsidian: bool = False,
+    stale_semantic_sources: list[str] | None = None,
 ) -> str:
     today = date.today().isoformat()
 
@@ -140,6 +179,10 @@ def generate(
             "- Run `git rev-parse HEAD` and compare to check if the graph is stale.",
             "- Run `graphify update .` after code changes (no API cost).",
         ]
+
+    # Per-source semantic freshness sits next to graph freshness: both answer
+    # "how much of this describes the Corpus as it is now?".
+    _semantic_freshness_section(lines, stale_semantic_sources)
 
     # Community hub navigation. The `_COMMUNITY_*.md` notes these wikilinks target
     # are only created by the opt-in `--obsidian` export, and the report is written
