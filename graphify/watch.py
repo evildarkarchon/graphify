@@ -91,53 +91,38 @@ def _read_build_gitignore(out_dir: Path) -> bool:
     return True
 
 
-def _merge_changed_paths(*sources: "list[Path] | None") -> list[Path]:
-    """Concatenate path lists, preserving order and dropping duplicates.
-
-    Used to combine a hook process's own ``changed_paths`` with the path hints of
-    the requests other processes durably accepted, so the rebuild that owns the
-    executor lease covers every queued commit's worth of files (#1059).
-    """
-    seen: set[str] = set()
-    out: list[Path] = []
-    for src in sources:
-        if not src:
-            continue
-        for p in src:
-            key = os.fspath(p)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(p)
-    return out
-
-
-def _merged_change_set(
-    changed_paths: "list[Path] | None",
+def _coalesced_rebuild(
     accepted: "Sequence[_AcceptedRequest]",
-    own: "_AcceptedRequest | None",
-) -> "list[Path] | None":
-    """Return the change set one rebuild must cover, or None for a full rebuild.
+) -> "tuple[list[Path] | None, bool]":
+    """Return the change set and ``force`` one rebuild must cover for ``accepted``.
 
-    ``accepted`` is the durable requests this rebuild is about to cover and
-    ``own`` is this process's own record, whose hints are already in
-    ``changed_paths``. A queued request that carries no path hints asked for a
-    full-corpus rebuild, so it widens the merged set to everything rather than
-    being merged in as zero files — the ``.pending_changes`` file this replaces
-    could not express that distinction at all.
+    The merge itself belongs to ``CorpusGraph``, so this only translates one
+    coalesced unit into the arguments this legacy rebuild path takes: an empty
+    hint set means the whole corpus, which ``_rebuild_code`` spells ``None``.
+    ``force`` is unioned rather than taken from this process, because a queued
+    request that authorized replacing the graph with a smaller one must still get
+    that authority from whichever executor ends up covering it.
+
+    ``accepted`` is filtered to Code-update requests by the caller, and those are
+    always mutually compatible, so coalescing yields exactly one unit. Anything
+    else means a request kind this rebuild path cannot perform reached the
+    snapshot: it falls back to a whole-corpus rebuild without ``force`` and lets
+    the caller's own coverage rules stand, rather than reading one unit and
+    silently dropping the rest.
     """
-    if changed_paths is None:
-        # Our own full-corpus rebuild already supersedes queued incremental work.
-        return None
-    others = [
-        request
-        for request in accepted
-        if own is None or request.request_id != own.request_id
-    ]
-    if any(not request.changed_paths for request in others):
-        return None
-    hints = [Path(hint) for request in others for hint in request.changed_paths]
-    return _merge_changed_paths(changed_paths, hints)
+    # Imported inside the function like every other generation import in this
+    # module: `graphify.watch` is on the CLI startup path and must not pull the
+    # generation package in until a rebuild actually runs.
+    from graphify.generation._coordination import _coalesce
+
+    units = _coalesce(accepted)
+    if len(units) != 1 or units[0].operation != "code-update":
+        return None, False
+    unit = units[0]
+    return (
+        [Path(hint) for hint in unit.changed_paths] or None,
+        unit.authority.force,
+    )
 
 
 def _apply_resource_limits() -> None:
@@ -829,6 +814,7 @@ def _rebuild_code(
             _LATE_ARRIVAL_PASSES,
             _LeaseOutcome,
             _RequestCoordinator,
+            _RequestedAuthority,
         )
 
         coordinator = _RequestCoordinator(
@@ -839,9 +825,13 @@ def _rebuild_code(
         # hook that loses the race still recorded its change set. Unlike the
         # ``.pending_changes`` file this replaces, a full-corpus rebuild is
         # accepted too — losing the lease used to drop it entirely.
-        accepted = coordinator.accept(
+        coordinator.accept(
             "code-update",
             changed_paths=changed_paths or (),
+            # Recorded, not just applied here: a hook that loses the lease still
+            # authorized replacing the graph with a smaller one, and the executor
+            # that covers its change set has to know that.
+            authority=_RequestedAuthority(force=force),
         )
         with coordinator.executor_lease(
             timeout=None if block_on_lock else 0.0,
@@ -851,15 +841,16 @@ def _rebuild_code(
                       f"{watch_path.resolve()} - changes queued.")
                 return False
             # Lease acquired. Cover every request accepted before this rebuild
-            # started, merging the other processes' path hints into our own
-            # change set so one rebuild covers everything outstanding.
+            # started by coalescing them — including our own record, whose hints
+            # and ``force`` went into the queue above — so one rebuild covers
+            # everything outstanding with everything each caller asked for.
             covered = coordinator.pending(operations=code_update_only)
-            merged = _merged_change_set(changed_paths, covered, accepted)
+            merged, merged_force = _coalesced_rebuild(covered)
             ok = _rebuild_code(
                 watch_path,
                 changed_paths=merged,
                 follow_symlinks=follow_symlinks,
-                force=force,
+                force=force or merged_force,
                 no_cluster=no_cluster,
                 acquire_lock=False,
             )
@@ -876,11 +867,12 @@ def _rebuild_code(
                     late = coordinator.pending(operations=code_update_only)
                     if not late:
                         break
+                    late_paths, late_force = _coalesced_rebuild(late)
                     ok = _rebuild_code(
                         watch_path,
-                        changed_paths=_merged_change_set([], late, None),
+                        changed_paths=late_paths,
                         follow_symlinks=follow_symlinks,
-                        force=force,
+                        force=force or late_force,
                         no_cluster=no_cluster,
                         acquire_lock=False,
                     ) and ok

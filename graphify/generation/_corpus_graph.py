@@ -8,8 +8,11 @@ from graphify.generation._code_update import _execute_code_update
 from graphify.generation._coordination import (
     _LATE_ARRIVAL_PASSES,
     _AcceptedRequest,
+    _CoalescedRequest,
     _LeaseOutcome,
     _RequestCoordinator,
+    _RequestedAuthority,
+    _coalesce,
 )
 from graphify.generation._publication import _Publication
 from graphify.generation._publisher import _Publisher
@@ -95,11 +98,11 @@ class CorpusGraph:
         accepted = coordinator.accept(
             "code-update",
             changed_paths=request.changed_paths,
-            force=request.force,
+            authority=_RequestedAuthority(force=request.force),
         )
         if isinstance(completion, ReturnWhenQueued):
             return Queued(request_id=accepted.request_id)
-        return self._execute_code_update(coordinator, accepted, request)
+        return self._execute_code_update(coordinator, accepted)
 
     def reclustering(
         self,
@@ -121,9 +124,15 @@ class CorpusGraph:
         self,
         coordinator: _RequestCoordinator,
         accepted: _AcceptedRequest,
-        request: CodeUpdateRequest,
     ) -> TerminalOutcome:
-        """Execute one accepted Code update as this Corpus's single executor."""
+        """Execute one accepted Code update as this Corpus's single executor.
+
+        The caller's own request is executed *through the queue* rather than
+        beside it: it was made durable before the lease was contended for, so it
+        is one of the accepted requests coalesced here. That is what lets this
+        executor honor a ``force`` another process asked for, and it is why the
+        returned outcome describes the work that covered this caller.
+        """
         kinds = coordinator.subsumed_by("code-update")
         with coordinator.executor_lease(until_covered=accepted) as lease:
             if lease is _LeaseOutcome.COVERED:
@@ -136,23 +145,59 @@ class CorpusGraph:
             # owns from authoritative discovery, so it covers every request
             # accepted before it started regardless of their path hints. Requests
             # that arrive mid-run are deliberately left for the passes below.
-            covered = coordinator.pending(operations=kinds)
-            primary = _execute_code_update(self._corpus, request)
+            primary = self._cover_pending(
+                coordinator,
+                coordinator.pending(operations=kinds),
+            )
             if not _advances_corpus_state(primary):
                 # A refusal or failure changed nothing, so the queued work stays
                 # accepted for whichever executor manages to cover it next.
                 return primary
-            coordinator.cover(covered)
             for _ in range(_LATE_ARRIVAL_PASSES):
                 late = coordinator.pending(operations=kinds)
                 if not late:
                     break
                 if not _advances_corpus_state(
-                    _execute_code_update(self._corpus, request)
+                    self._cover_pending(coordinator, late)
                 ):
+                    # Whatever is still queued stays durably accepted rather than
+                    # being retried until this process gives up on it.
                     break
-                coordinator.cover(late)
             return primary
+
+    def _cover_pending(
+        self,
+        coordinator: _RequestCoordinator,
+        pending: tuple[_AcceptedRequest, ...],
+    ) -> TerminalOutcome:
+        """Run the coalesced Code-update work for ``pending`` and retire what it covers.
+
+        ``pending`` is filtered to the request kinds a Code update covers, and
+        every such request is mutually compatible — hints and ``force`` both
+        union, and no other authority may be accepted for this operation — so
+        coalescing yields exactly one unit. That invariant is asserted rather
+        than worked around: a second unit would mean this executor had been
+        handed work it cannot perform, and retiring it would claim coverage
+        nothing earned.
+
+        The unit is retired only after the operation advanced Corpus state, so a
+        failure leaves every request it would have covered durably accepted. An
+        empty queue means another executor covered this caller between acceptance
+        and the lease.
+        """
+        units = _coalesce(pending)
+        if not units:
+            return AlreadyCurrent()
+        if len(units) != 1 or units[0].operation != "code-update":
+            return OperationFailed(
+                "the Code-update executor was given queued work it cannot "
+                f"perform: {sorted({unit.operation for unit in units})}"
+            )
+        unit = units[0]
+        outcome = _execute_code_update(self._corpus, _code_update_for(unit))
+        if _advances_corpus_state(outcome):
+            coordinator.cover(unit.covers)
+        return outcome
 
     def _complete(
         self,
@@ -192,6 +237,19 @@ class CorpusGraph:
         """Reject a completion policy outside the agreed closed union."""
         if not isinstance(completion, (WaitUntilCovered, ReturnWhenQueued)):
             raise TypeError("completion must be WaitUntilCovered or ReturnWhenQueued")
+
+
+def _code_update_for(unit: _CoalescedRequest) -> CodeUpdateRequest:
+    """Return the Code update one coalesced unit asks this executor to run.
+
+    Only the hints and ``force`` survive the trip: those are the whole of what a
+    Code-update request may carry, and coalescing has already refused to accept
+    any other authority for this operation.
+    """
+    return CodeUpdateRequest(
+        changed_paths=tuple(Path(hint) for hint in unit.changed_paths),
+        force=unit.authority.force,
+    )
 
 
 def _advances_corpus_state(outcome: TerminalOutcome) -> bool:

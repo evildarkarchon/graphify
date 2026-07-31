@@ -50,3 +50,15 @@ A community label intentionally supplied by a human or skill. It outranks genera
 **Semantic labeling**:
 Optional interpretation that enriches community labels without changing the source contributions or topology of the corpus graph.
 _Avoid_: Reclustering
+
+**Accepted request**:
+One durably recorded ask for a corpus operation, owned by the corpus rather than by the process that submitted it.
+_Avoid_: Pending change
+
+**Requested authority**:
+An explicit permission an accepted request carries to bypass one safety rule, such as replacing a smaller graph, publishing a partial full extraction, replacing the corpus build policy, or overwriting curated community labels.
+_Avoid_: Flag, Option
+
+**Request coalescing**:
+The deterministic merge that turns the accepted requests for one corpus into the fewest operations that still cover every one of them, carrying each request's changed-path hints and requested authority onto the operation that covers it.
+_Avoid_: Debounce, Deduplication

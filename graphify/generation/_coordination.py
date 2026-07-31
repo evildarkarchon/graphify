@@ -1,17 +1,29 @@
-"""Durable cross-process request acceptance and executor leasing for one Corpus.
+"""Durable cross-process request acceptance, coalescing, and executor leasing.
 
-Two pieces of coordination state live here, both owned by ``CorpusGraph``:
+Three pieces of coordination state live here, all owned by ``CorpusGraph``:
 
 * a **durable request queue** — one fsynced record per accepted request, so a
-  background caller can be told ``Queued`` and then exit without losing work; and
+  background caller can be told ``Queued`` and then exit without losing work;
+* **request coalescing** — the deterministic merge that turns the accepted
+  requests for one Corpus into the smallest set of operations that still covers
+  every one of them, carrying rather than discarding what each asked for; and
 * one **executor lease** — the cross-platform claim that makes exactly one
   process responsible for recovery and publication at a time.
 
-Both replace the previous POSIX-only ``flock`` and the path-only
-``.pending_changes`` file. The queue records typed requests rather than bare
-paths, so an accepted request survives the death of the process that submitted
-it *and* the death of the process that was executing it; the lease is recovered
-without manual cleanup when its holder can no longer be proven alive.
+The queue and the lease replace the previous POSIX-only ``flock`` and the
+path-only ``.pending_changes`` file. The queue records typed requests rather than
+bare paths, so an accepted request survives the death of the process that
+submitted it *and* the death of the process that was executing it; the lease is
+recovered without manual cleanup when its holder can no longer be proven alive.
+
+Coalescing is what makes that queue cheap to drain without becoming a way to
+lose work. It merges *intent*: changed-path hints union, a Full extraction
+absorbs the ordinary Code update and Reclustering work it would redo anyway, and
+every explicit authority a caller asked for — ``force``, partial-publication
+authority, policy replacement, Curated-label adoption, and a one-shot
+Semantic-labeling policy — is carried onto the operation that will cover it.
+Requests whose exclusive policies disagree are kept as separate units rather
+than resolved by discarding one of them.
 """
 
 from __future__ import annotations
@@ -55,6 +67,18 @@ _SUBSUMES: Mapping[str, frozenset[str]] = {
     "reclustering": frozenset({"reclustering"}),
 }
 
+# Which operations may carry each explicit authority. An authority offered to an
+# operation that cannot exercise it is rejected before the request is made
+# durable, so the queue never holds a promise nothing can keep: Code update in
+# particular stays fail closed, and only Full extraction may replace the active
+# Corpus policy or publish a partial result.
+_AUTHORITY_OPERATIONS: Mapping[str, frozenset[str]] = {
+    "allow_partial_publication": frozenset({"full-extraction"}),
+    "policy_replacement": frozenset({"full-extraction"}),
+    "adopt_curated_labels": frozenset({"full-extraction", "reclustering"}),
+    "semantic_labeling": frozenset({"full-extraction", "reclustering"}),
+}
+
 # A lease whose heartbeat is older than this can no longer prove it is owned.
 # The holder renews well inside the window, so only a stopped executor expires.
 _DEFAULT_LEASE_TTL = 30.0
@@ -82,6 +106,140 @@ class _LeaseOutcome(Enum):
 
 
 @dataclass(frozen=True)
+class _PolicyReplacement:
+    """Explicit authority to replace the active Corpus build policy.
+
+    Full extraction preserves the active policy by default, so the presence of
+    this value — not its contents — is what distinguishes "keep the recorded
+    policy" from "the caller decided the Corpus is shaped differently now". An
+    instance with the documented defaults therefore still means *replace*.
+    """
+
+    excludes: tuple[str, ...] = ()
+    gitignore: bool = True
+
+
+@dataclass(frozen=True)
+class _SemanticLabeling:
+    """One request's one-shot Semantic-labeling policy.
+
+    Backend, model, concurrency, and refresh scope apply only to the request
+    that carried them, which is why two differing policies cannot be folded into
+    one another during coalescing: the merged result would be a policy nobody
+    asked for.
+    """
+
+    backend: str | None = None
+    model: str | None = None
+    concurrency: int | None = None
+    refresh_all: bool = False
+
+
+@dataclass(frozen=True)
+class _RequestedAuthority:
+    """The safety rules one request explicitly took responsibility for bypassing.
+
+    Coalescing may carry authority onto a covering operation but may never drop
+    it, so this travels with a request from acceptance through to the executor
+    that eventually honors it. The boolean fields union; the two policy fields
+    are exclusive — one operation can carry only one of each — so two differing
+    values are a disagreement rather than something to average.
+    """
+
+    force: bool = False
+    allow_partial_publication: bool = False
+    adopt_curated_labels: bool = False
+    policy_replacement: _PolicyReplacement | None = None
+    semantic_labeling: _SemanticLabeling | None = None
+
+    def merge(self, other: "_RequestedAuthority") -> "_RequestedAuthority | None":
+        """Return the authority covering both, or None when the two disagree.
+
+        Disagreement is not resolved here on purpose: picking a winner would
+        silently answer one of the two requests with a policy it did not ask
+        for. The caller keeps them as separate units instead.
+        """
+        if _disagree(self.policy_replacement, other.policy_replacement) or _disagree(
+            self.semantic_labeling,
+            other.semantic_labeling,
+        ):
+            return None
+        return _RequestedAuthority(
+            force=self.force or other.force,
+            allow_partial_publication=(
+                self.allow_partial_publication or other.allow_partial_publication
+            ),
+            adopt_curated_labels=(
+                self.adopt_curated_labels or other.adopt_curated_labels
+            ),
+            # Non-disagreeing means at most one side is set, or both are equal,
+            # so taking the first truthy one loses nothing.
+            policy_replacement=self.policy_replacement or other.policy_replacement,
+            semantic_labeling=self.semantic_labeling or other.semantic_labeling,
+        )
+
+    def permitted_for(self, operation: str) -> str | None:
+        """Return an authority this operation may not exercise, or None if all are.
+
+        Named rather than boolean so the refusal can say which authority was
+        impossible, which is the only part a caller can act on.
+        """
+        offered = {
+            "allow_partial_publication": self.allow_partial_publication,
+            "adopt_curated_labels": self.adopt_curated_labels,
+            "policy_replacement": self.policy_replacement is not None,
+            "semantic_labeling": self.semantic_labeling is not None,
+        }
+        for authority, requested in offered.items():
+            if requested and operation not in _AUTHORITY_OPERATIONS[authority]:
+                return authority
+        return None
+
+
+def _disagree(left: Any, right: Any) -> bool:
+    """Return whether two exclusive policies cannot both be honored at once."""
+    return left is not None and right is not None and left != right
+
+
+# The ordinary request: it asked for work, not for a safety rule to be waived.
+# Shared because the value is immutable, which also keeps it out of a mutable
+# default argument.
+_NO_AUTHORITY = _RequestedAuthority()
+
+
+def _authority_record(authority: _RequestedAuthority) -> dict[str, Any]:
+    """Return the durable-record fields describing one request's authority.
+
+    Written as flat keys beside the operation rather than a nested object so a
+    record stays readable by hand when someone is working out why a queue did
+    not drain. Both policies encode as ``None`` when unrequested, which is what
+    a reader without them turns back into "no authority asked for".
+    """
+    policy = authority.policy_replacement
+    labeling = authority.semantic_labeling
+    return {
+        "force": authority.force,
+        "allow_partial_publication": authority.allow_partial_publication,
+        "adopt_curated_labels": authority.adopt_curated_labels,
+        "policy_replacement": (
+            {"excludes": list(policy.excludes), "gitignore": policy.gitignore}
+            if policy is not None
+            else None
+        ),
+        "semantic_labeling": (
+            {
+                "backend": labeling.backend,
+                "model": labeling.model,
+                "concurrency": labeling.concurrency,
+                "refresh_all": labeling.refresh_all,
+            }
+            if labeling is not None
+            else None
+        ),
+    }
+
+
+@dataclass(frozen=True)
 class _AcceptedRequest:
     """One durably accepted request for a Corpus."""
 
@@ -89,10 +247,158 @@ class _AcceptedRequest:
     sequence: int
     operation: str
     changed_paths: tuple[str, ...]
-    force: bool
+    authority: _RequestedAuthority
     pid: int
     host: str
     path: Path
+
+
+@dataclass(frozen=True)
+class _CoalescedRequest:
+    """One merged unit of work and the accepted requests it will cover.
+
+    ``changed_paths`` is empty when any covered request asked for whole-Corpus
+    work: a request that carried no hint asked about every source, so it widens
+    the unit rather than contributing zero files to it. ``covers`` is what an
+    executor retires once — and only once — this unit has genuinely been done.
+    """
+
+    operation: str
+    changed_paths: tuple[str, ...]
+    authority: _RequestedAuthority
+    covers: tuple[_AcceptedRequest, ...]
+
+
+def _acceptance_order(request: _AcceptedRequest) -> tuple[int, str]:
+    """Return the total order accepted requests are always considered in."""
+    return request.sequence, request.request_id
+
+
+def _coalesce(requests: Iterable[_AcceptedRequest]) -> tuple[_CoalescedRequest, ...]:
+    """Merge accepted requests into the fewest units that still cover them all.
+
+    Two requests belong in one unit when one operation subsumes the other and
+    their exclusive policies do not disagree; everything else merges by union, so
+    no caller's authority depends on winning a race. An incompatible request
+    opens its own unit rather than being dropped or silently rewritten, which is
+    what keeps "coalesced" from meaning "some of the work was thrown away".
+
+    The plan depends only on which requests are outstanding, never on the order
+    they arrived in: every merged field is derived from the covered requests in
+    acceptance order, and the greedy fold below is compacted to a fixed point
+    afterwards. Two executors reading one queue therefore plan identically.
+    """
+    units: list[_CoalescedRequest] = []
+    for request in sorted(requests, key=_acceptance_order):
+        unit = _unit_over((request,), request.operation, request.authority)
+        for index, existing in enumerate(units):
+            merged = _merge_units(existing, unit)
+            if merged is not None:
+                units[index] = merged
+                break
+        else:
+            units.append(unit)
+    _compact(units)
+    return tuple(units)
+
+
+def _compact(units: list[_CoalescedRequest]) -> None:
+    """Fold units into each other until no two remaining ones can merge.
+
+    Folding a request in can *widen* a unit's operation, and the widened unit may
+    then subsume a unit opened earlier — a Full extraction accepted after a
+    Reclustering is the ordinary case, since neither Code update nor Reclustering
+    covers the other but a Full extraction covers both. Without this pass the
+    number of operations would depend on the order the requests happened to
+    arrive in. Restarting from the top after each merge is affordable because
+    units are bounded by the distinct exclusive policies outstanding, not by the
+    size of the queue.
+    """
+    merged_any = True
+    while merged_any:
+        merged_any = False
+        for index in range(len(units)):
+            for other in range(index + 1, len(units)):
+                merged = _merge_units(units[index], units[other])
+                if merged is None:
+                    continue
+                units[index] = merged
+                del units[other]
+                merged_any = True
+                break
+            if merged_any:
+                break
+
+
+def _merge_units(
+    left: _CoalescedRequest,
+    right: _CoalescedRequest,
+) -> _CoalescedRequest | None:
+    """Return one unit covering both, or None when they cannot be merged."""
+    operation = _covering_operation(left.operation, right.operation)
+    if operation is None:
+        return None
+    authority = left.authority.merge(right.authority)
+    if authority is None:
+        return None
+    return _unit_over(left.covers + right.covers, operation, authority)
+
+
+def _unit_over(
+    covers: tuple[_AcceptedRequest, ...],
+    operation: str,
+    authority: _RequestedAuthority,
+) -> _CoalescedRequest:
+    """Build the unit covering ``covers``, deriving its change set from them.
+
+    Deriving rather than accumulating is what makes the result independent of
+    the order units were folded in: the same set of covered requests always
+    produces the same change set, in acceptance order.
+    """
+    ordered = tuple(sorted(covers, key=_acceptance_order))
+    return _CoalescedRequest(
+        operation=operation,
+        changed_paths=_union_hints(request.changed_paths for request in ordered),
+        authority=authority,
+        covers=ordered,
+    )
+
+
+def _covering_operation(left: str, right: str) -> str | None:
+    """Return the operation covering both, or None when neither subsumes the other.
+
+    Code update and Reclustering reconcile different halves of a Graph
+    generation, so neither covers the other and they stay separate units. A Full
+    extraction redoes both, so it absorbs them.
+    """
+    if right in _SUBSUMES[left]:
+        return left
+    if left in _SUBSUMES[right]:
+        return right
+    return None
+
+
+def _union_hints(hint_sets: Iterable[tuple[str, ...]]) -> tuple[str, ...]:
+    """Union changed-path hint sets, in the order given, without duplicates.
+
+    An empty hint set means "the whole Corpus", not "no files", so it absorbs
+    every other set instead of being merged in as nothing — the distinction the
+    ``.pending_changes`` file this replaces could not express at all. Duplicates
+    are judged case-insensitively where the platform is, so two spellings of one
+    file do not both survive the merge.
+    """
+    seen: set[str] = set()
+    merged: list[str] = []
+    for hints in hint_sets:
+        if not hints:
+            return ()
+        for hint in hints:
+            key = os.path.normcase(hint)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(hint)
+    return tuple(merged)
 
 
 def _lease_ttl() -> float:
@@ -388,10 +694,52 @@ def _read_request(path: Path) -> _AcceptedRequest | None:
         sequence=record["sequence"],
         operation=record["operation"],
         changed_paths=tuple(value for value in changed_paths if isinstance(value, str)),
-        force=bool(record.get("force")),
+        authority=_RequestedAuthority(
+            force=bool(record.get("force")),
+            allow_partial_publication=bool(record.get("allow_partial_publication")),
+            adopt_curated_labels=bool(record.get("adopt_curated_labels")),
+            policy_replacement=_read_policy_replacement(
+                record.get("policy_replacement")
+            ),
+            semantic_labeling=_read_semantic_labeling(record.get("semantic_labeling")),
+        ),
         pid=record["pid"] if isinstance(record.get("pid"), int) else 0,
         host=record["host"] if isinstance(record.get("host"), str) else "",
         path=path,
+    )
+
+
+def _read_policy_replacement(value: Any) -> _PolicyReplacement | None:
+    """Rebuild a recorded policy replacement, or None when none was requested."""
+    if not isinstance(value, Mapping):
+        return None
+    excludes = value.get("excludes")
+    return _PolicyReplacement(
+        excludes=(
+            tuple(item for item in excludes if isinstance(item, str))
+            if isinstance(excludes, list)
+            else ()
+        ),
+        # Absent means the documented default rather than "do not honor VCS
+        # ignore files": a truncated field must not quietly widen the Corpus.
+        gitignore=bool(value.get("gitignore", True)),
+    )
+
+
+def _read_semantic_labeling(value: Any) -> _SemanticLabeling | None:
+    """Rebuild a recorded Semantic-labeling policy, or None when none was asked for."""
+    if not isinstance(value, Mapping):
+        return None
+    concurrency = value.get("concurrency")
+    return _SemanticLabeling(
+        backend=value["backend"] if isinstance(value.get("backend"), str) else None,
+        model=value["model"] if isinstance(value.get("model"), str) else None,
+        concurrency=(
+            concurrency
+            if isinstance(concurrency, int) and not isinstance(concurrency, bool)
+            else None
+        ),
+        refresh_all=bool(value.get("refresh_all")),
     )
 
 
@@ -413,16 +761,30 @@ class _RequestCoordinator:
         operation: str,
         *,
         changed_paths: Iterable[str | Path] = (),
-        force: bool = False,
+        authority: _RequestedAuthority = _NO_AUTHORITY,
     ) -> _AcceptedRequest:
-        """Durably record one request and return it.
+        """Durably record one request, with everything it asked for, and return it.
 
         The record is on disk before this returns, which is the guarantee a
         background caller needs: it may exit immediately afterwards and the work
         still belongs to the Corpus rather than to the process that asked for it.
+        Requested authority is recorded alongside the operation because it is the
+        request, not the executing process, that authorized bypassing a safety
+        rule — an executor that later coalesces this request must be able to
+        honor that without having been the process that was told to.
+
+        Raises ``ValueError`` for an unknown operation, or for authority the
+        operation cannot exercise, before anything is written — so an impossible
+        promise never becomes durable state something would have to strand.
         """
         if operation not in _OPERATIONS:
             raise ValueError(f"unknown Graph-generation operation: {operation}")
+        impossible = authority.permitted_for(operation)
+        if impossible is not None:
+            raise ValueError(
+                f"{operation} cannot exercise {impossible}; only "
+                f"{', '.join(sorted(_AUTHORITY_OPERATIONS[impossible]))} may"
+            )
         request_id = uuid.uuid4().hex
         # Wall-clock nanoseconds, zero padded into the file name, so a plain
         # directory listing sorts into acceptance order without a shared counter.
@@ -438,7 +800,7 @@ class _RequestCoordinator:
                 "sequence": sequence,
                 "operation": operation,
                 "changed_paths": list(hints),
-                "force": bool(force),
+                **_authority_record(authority),
                 "pid": os.getpid(),
                 "host": _HOST,
             },
@@ -448,7 +810,7 @@ class _RequestCoordinator:
             sequence=sequence,
             operation=operation,
             changed_paths=hints,
-            force=bool(force),
+            authority=authority,
             pid=os.getpid(),
             host=_HOST,
             path=path,

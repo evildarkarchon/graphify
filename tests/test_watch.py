@@ -1597,11 +1597,13 @@ def test_rebuild_code_merges_accepted_requests_on_acquire(tmp_path, monkeypatch)
     )
     assert ok is True
 
-    # The first inner call must have received the merged + deduped set:
-    # own.py first (caller's order preserved), then the accepted queued1/queued2,
-    # with queued1.py deduped against own's prior occurrence.
+    # The first inner call must have received the merged + deduped set, in the
+    # order the requests were accepted rather than this process's own order: the
+    # earlier contender's hints come first, and own.py's duplicate queued1.py is
+    # deduped against them. Acceptance order is what makes the merge produce the
+    # same change set on every executor that reads this queue (#8).
     assert inner_calls, "inner _rebuild_code should have been called"
-    assert inner_calls[0] == ["own.py", "queued1.py", "queued2.py"]
+    assert inner_calls[0] == ["queued1.py", "queued2.py", "own.py"]
     # And every request the rebuild covered is retired.
     assert coordinator.pending() == ()
 
@@ -1691,19 +1693,6 @@ def test_rebuild_code_accepted_request_survives_a_failed_rebuild(tmp_path, monke
 
     assert orig_rebuild(tmp_path, changed_paths=[Path("own.py")]) is False
     assert [request.changed_paths for request in coordinator.pending()] == [("own.py",)]
-
-
-def test_merge_changed_paths_dedupes_in_order():
-    """_merge_changed_paths preserves first-seen order and drops dupes."""
-    from graphify.watch import _merge_changed_paths
-
-    merged = _merge_changed_paths(
-        [Path("a.py"), Path("b.py")],
-        None,
-        [Path("b.py"), Path("c.py")],
-        [Path("a.py")],
-    )
-    assert [p.as_posix() for p in merged] == ["a.py", "b.py", "c.py"]
 
 
 def test_rebuild_code_preserves_nodes_from_excluded_but_alive_file(tmp_path, capsys):

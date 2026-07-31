@@ -1,9 +1,10 @@
-"""Production-operation tests for durable request acceptance and executor leases.
+"""Production-operation tests for request acceptance, coalescing, and leases.
 
 Every test drives real temporary Corpora through the production ``CorpusGraph``
 interface and its private coordination implementation. Cross-process behavior is
 exercised with real subprocesses that are really terminated, because a durable
-queue and a recoverable lease only mean anything against a process that dies.
+queue, a recoverable lease, and a coalescing rule that must not lose work only
+mean anything against a process that dies.
 """
 
 from __future__ import annotations
@@ -73,6 +74,601 @@ def _graph_labels(output: Path) -> set[str]:
     """Return the node labels of the active materialized graph."""
     graph = json.loads((output / "graph.json").read_text(encoding="utf-8"))
     return {node["label"] for node in graph["nodes"]}
+
+
+def _plan(root: Path, output: Path):
+    """Return the coalesced plan the next executor of this Corpus would run."""
+    from graphify.generation._coordination import _coalesce
+
+    return _coalesce(_coordinator(root, output).pending())
+
+
+_QUEUE_CODE_UPDATE_SCRIPT = """
+import sys
+from pathlib import Path
+
+from graphify.generation import (
+    CodeUpdateRequest,
+    Corpus,
+    CorpusGraph,
+    Queued,
+    ReturnWhenQueued,
+)
+
+root, output = Path(sys.argv[1]), Path(sys.argv[2])
+hints = tuple(Path(hint) for hint in sys.argv[3:] if hint)
+outcome = CorpusGraph(Corpus(root=root, output=output)).code_update(
+    CodeUpdateRequest(hints),
+    completion=ReturnWhenQueued(),
+)
+assert isinstance(outcome, Queued), outcome
+print(outcome.request_id, flush=True)
+"""
+
+
+# --- coalescing changed-path hints -------------------------------------------
+
+
+def test_changed_path_hints_from_separate_processes_union_deterministically(
+    tmp_path,
+) -> None:
+    """Union every submitter's hints once, in acceptance order, every time.
+
+    Three real processes each accept a request and exit. The executor that
+    eventually runs sees one merged change set containing every hint exactly
+    once, and reading the same queue again produces the identical plan — a hint
+    must not depend on which process happened to survive to run the work.
+    """
+    output = tmp_path / "graphify-out"
+    for index, hints in enumerate(
+        (("alpha.py", "shared.py"), ("beta.py",), ("shared.py", "gamma.py"))
+    ):
+        _run_child(
+            tmp_path / f"queue{index}.py",
+            _QUEUE_CODE_UPDATE_SCRIPT,
+            str(tmp_path),
+            str(output),
+            *hints,
+        )
+
+    plan = _plan(tmp_path, output)
+
+    assert len(plan) == 1
+    unit = plan[0]
+    assert unit.operation == "code-update"
+    # Every hint survives, exactly once, and in the order the requests were
+    # accepted rather than the order the processes happened to finish in.
+    accepted = _coordinator(tmp_path, output).pending()
+    expected: list[str] = []
+    for request in accepted:
+        expected.extend(
+            hint for hint in request.changed_paths if hint not in expected
+        )
+    assert list(unit.changed_paths) == expected
+    assert set(unit.changed_paths) == {
+        "alpha.py",
+        "beta.py",
+        "gamma.py",
+        "shared.py",
+    }
+    assert len(unit.covers) == 3
+    # Deterministic: the same queue plans the same way on every executor.
+    assert _plan(tmp_path, output) == plan
+
+
+def test_a_request_without_hints_widens_the_union_to_the_whole_corpus(
+    tmp_path,
+) -> None:
+    """Treat a hintless request as asking about every source, not about none.
+
+    A post-checkout hook accepts a whole-Corpus rebuild with no hints. Merging
+    that in as zero files would quietly narrow the covering operation to the
+    other submitters' paths — the exact loss the path-only pending file used to
+    cause.
+    """
+    output = tmp_path / "graphify-out"
+    _run_child(
+        tmp_path / "hinted.py",
+        _QUEUE_CODE_UPDATE_SCRIPT,
+        str(tmp_path),
+        str(output),
+        "narrow.py",
+    )
+    _run_child(
+        tmp_path / "whole.py",
+        _QUEUE_CODE_UPDATE_SCRIPT,
+        str(tmp_path),
+        str(output),
+    )
+
+    plan = _plan(tmp_path, output)
+
+    assert len(plan) == 1
+    assert plan[0].changed_paths == ()
+    assert len(plan[0].covers) == 2
+
+
+# --- coalescing operations ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "arrival",
+    [
+        ("code-update", "full-extraction", "reclustering"),
+        ("code-update", "reclustering", "full-extraction"),
+        ("reclustering", "code-update", "full-extraction"),
+        ("full-extraction", "code-update", "reclustering"),
+        ("reclustering", "full-extraction", "code-update"),
+        ("full-extraction", "reclustering", "code-update"),
+    ],
+)
+def test_a_queued_full_extraction_covers_ordinary_code_update_and_reclustering(
+    tmp_path,
+    arrival,
+) -> None:
+    """Let one Full extraction absorb the ordinary work it would redo anyway.
+
+    Every arrival order is exercised because coalescing must depend only on what
+    is outstanding. Neither Code update nor Reclustering covers the other, so an
+    order that opens both units before the Full extraction arrives is the case
+    where a merge that never revisits an earlier unit would plan two operations
+    for work one operation does.
+    """
+    output = tmp_path / "graphify-out"
+    coordinator = _coordinator(tmp_path, output)
+    accepted = [
+        coordinator.accept(
+            operation,
+            changed_paths=("changed.py",) if operation == "code-update" else (),
+        )
+        for operation in arrival
+    ]
+
+    plan = _plan(tmp_path, output)
+
+    assert len(plan) == 1
+    unit = plan[0]
+    assert unit.operation == "full-extraction"
+    assert {covered.request_id for covered in unit.covers} == {
+        request.request_id for request in accepted
+    }
+    # The Full extraction carried no hints, so the merged unit reconciles the
+    # whole Corpus rather than only the Code update's changed file.
+    assert unit.changed_paths == ()
+
+
+def test_code_update_and_reclustering_never_cover_each_other(tmp_path) -> None:
+    """Keep operations that reconcile different halves of a generation apart.
+
+    Reclustering republishes community identity from the active Source
+    contributions and performs no discovery; a Code update does the opposite.
+    Merging them would mean one of the two requests was answered by work that
+    never did it.
+    """
+    output = tmp_path / "graphify-out"
+    coordinator = _coordinator(tmp_path, output)
+    update = coordinator.accept("code-update", changed_paths=("changed.py",))
+    recluster = coordinator.accept("reclustering")
+
+    plan = _plan(tmp_path, output)
+
+    assert [unit.operation for unit in plan] == ["code-update", "reclustering"]
+    assert [covered.request_id for unit in plan for covered in unit.covers] == [
+        update.request_id,
+        recluster.request_id,
+    ]
+
+
+# --- coalescing explicit authority --------------------------------------------
+
+
+def test_coalescing_carries_every_explicit_authority_onto_the_covering_operation(
+    tmp_path,
+) -> None:
+    """Never optimize away a safety rule a caller took responsibility for."""
+    from graphify.generation._coordination import (
+        _PolicyReplacement,
+        _RequestedAuthority,
+        _SemanticLabeling,
+    )
+
+    output = tmp_path / "graphify-out"
+    coordinator = _coordinator(tmp_path, output)
+    policy = _PolicyReplacement(excludes=("vendor/**",), gitignore=False)
+    labeling = _SemanticLabeling(backend="anthropic", model="a-model", refresh_all=True)
+    coordinator.accept(
+        "code-update",
+        changed_paths=("changed.py",),
+        authority=_RequestedAuthority(force=True),
+    )
+    coordinator.accept(
+        "full-extraction",
+        authority=_RequestedAuthority(
+            allow_partial_publication=True,
+            policy_replacement=policy,
+        ),
+    )
+    coordinator.accept(
+        "reclustering",
+        authority=_RequestedAuthority(
+            adopt_curated_labels=True,
+            semantic_labeling=labeling,
+        ),
+    )
+
+    plan = _plan(tmp_path, output)
+
+    assert len(plan) == 1
+    unit = plan[0]
+    assert unit.operation == "full-extraction"
+    assert unit.authority == _RequestedAuthority(
+        force=True,
+        allow_partial_publication=True,
+        adopt_curated_labels=True,
+        policy_replacement=policy,
+        semantic_labeling=labeling,
+    )
+
+
+def test_disagreeing_exclusive_policies_are_kept_as_separate_units(tmp_path) -> None:
+    """Refuse to invent a merged policy neither caller asked for.
+
+    A Semantic-labeling policy is one-shot and a policy replacement redefines
+    the Corpus, so two differing ones cannot be folded together. Each keeps its
+    own unit instead of one of them being silently discarded.
+    """
+    from graphify.generation._coordination import (
+        _PolicyReplacement,
+        _RequestedAuthority,
+        _SemanticLabeling,
+    )
+
+    output = tmp_path / "graphify-out"
+    coordinator = _coordinator(tmp_path, output)
+    accepted = [
+        coordinator.accept("full-extraction", authority=authority)
+        for authority in (
+            _RequestedAuthority(
+                policy_replacement=_PolicyReplacement(excludes=("vendor/**",))
+            ),
+            _RequestedAuthority(
+                policy_replacement=_PolicyReplacement(excludes=("build/**",))
+            ),
+        )
+    ] + [
+        coordinator.accept("reclustering", authority=authority)
+        for authority in (
+            _RequestedAuthority(semantic_labeling=_SemanticLabeling(backend="openai")),
+            _RequestedAuthority(
+                semantic_labeling=_SemanticLabeling(backend="anthropic")
+            ),
+        )
+    ]
+
+    plan = _plan(tmp_path, output)
+
+    # Two units, because each disagreeing pair had to split — but a Reclustering
+    # whose labeling policy does not disagree still joins a Full extraction, so
+    # splitting is what disagreement costs rather than the default.
+    assert len(plan) == 2
+    assert [unit.operation for unit in plan] == ["full-extraction"] * 2
+    assert [unit.authority.policy_replacement for unit in plan] == [
+        _PolicyReplacement(excludes=("vendor/**",)),
+        _PolicyReplacement(excludes=("build/**",)),
+    ]
+    assert [unit.authority.semantic_labeling for unit in plan] == [
+        _SemanticLabeling(backend="openai"),
+        _SemanticLabeling(backend="anthropic"),
+    ]
+    # Every request is still covered by exactly one unit, and no unit carries a
+    # policy that disagrees with one a request it covers asked for.
+    assert sorted(covered.request_id for unit in plan for covered in unit.covers) == (
+        sorted(request.request_id for request in accepted)
+    )
+    for unit in plan:
+        for covered in unit.covers:
+            assert covered.authority.policy_replacement in (
+                None,
+                unit.authority.policy_replacement,
+            )
+            assert covered.authority.semantic_labeling in (
+                None,
+                unit.authority.semantic_labeling,
+            )
+
+
+def test_an_operation_cannot_accept_authority_it_cannot_exercise(tmp_path) -> None:
+    """Refuse an impossible promise before it becomes durable state.
+
+    Code update is fail closed and never replaces Corpus policy, and no
+    operation but Reclustering or Full extraction publishes labels. Recording
+    such a request would put an authority in the queue that nothing can honor.
+    """
+    from graphify.generation._coordination import (
+        _PolicyReplacement,
+        _RequestedAuthority,
+        _SemanticLabeling,
+    )
+
+    output = tmp_path / "graphify-out"
+    coordinator = _coordinator(tmp_path, output)
+    refused = [
+        ("code-update", _RequestedAuthority(allow_partial_publication=True)),
+        ("code-update", _RequestedAuthority(policy_replacement=_PolicyReplacement())),
+        ("code-update", _RequestedAuthority(adopt_curated_labels=True)),
+        ("code-update", _RequestedAuthority(semantic_labeling=_SemanticLabeling())),
+        ("reclustering", _RequestedAuthority(allow_partial_publication=True)),
+        ("reclustering", _RequestedAuthority(policy_replacement=_PolicyReplacement())),
+    ]
+
+    for operation, authority in refused:
+        with pytest.raises(ValueError):
+            coordinator.accept(operation, authority=authority)
+
+    # ``force`` is the one authority every operation may exercise, so it is the
+    # control: the refusals above are about which authority, not about carrying
+    # any authority at all.
+    coordinator.accept("code-update", authority=_RequestedAuthority(force=True))
+    assert [request.operation for request in coordinator.pending()] == ["code-update"]
+
+
+def test_requested_authority_survives_the_process_that_asked_for_it(
+    tmp_path,
+) -> None:
+    """Read every authority back from disk after its submitter has exited."""
+    from graphify.generation._coordination import (
+        _PolicyReplacement,
+        _RequestedAuthority,
+        _SemanticLabeling,
+    )
+
+    output = tmp_path / "graphify-out"
+    _run_child(
+        tmp_path / "authorize.py",
+        """
+import sys
+from pathlib import Path
+
+from graphify.generation._coordination import (
+    _PolicyReplacement,
+    _RequestCoordinator,
+    _RequestedAuthority,
+    _SemanticLabeling,
+)
+from graphify.generation._types import Corpus
+
+root, output = Path(sys.argv[1]), Path(sys.argv[2])
+coordinator = _RequestCoordinator(Corpus(root=root, output=output))
+coordinator.accept(
+    "full-extraction",
+    changed_paths=("changed.py",),
+    authority=_RequestedAuthority(
+        force=True,
+        allow_partial_publication=True,
+        adopt_curated_labels=True,
+        policy_replacement=_PolicyReplacement(
+            excludes=("vendor/**",),
+            gitignore=False,
+        ),
+        semantic_labeling=_SemanticLabeling(
+            backend="anthropic",
+            model="a-model",
+            concurrency=4,
+            refresh_all=True,
+        ),
+    ),
+)
+""",
+        str(tmp_path),
+        str(output),
+    )
+
+    (request,) = _coordinator(tmp_path, output).pending()
+
+    assert request.operation == "full-extraction"
+    assert request.changed_paths == ("changed.py",)
+    assert request.authority == _RequestedAuthority(
+        force=True,
+        allow_partial_publication=True,
+        adopt_curated_labels=True,
+        policy_replacement=_PolicyReplacement(
+            excludes=("vendor/**",),
+            gitignore=False,
+        ),
+        semantic_labeling=_SemanticLabeling(
+            backend="anthropic",
+            model="a-model",
+            concurrency=4,
+            refresh_all=True,
+        ),
+    )
+
+
+def test_a_queued_force_authorization_reaches_the_executor_that_covers_it(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Run the covering operation with the authority the queued request carried.
+
+    A hook that authorized replacing the graph with a smaller one may lose the
+    lease and exit. The executor that covers its change set never asked for
+    ``force`` itself, so the authority has to travel with the request.
+
+    The request the production executor builds is inspected rather than an
+    output artifact, because a Code update reconciled from authoritative
+    discovery accounts for its own shrinkage per source — ``force`` changes no
+    artifact unless a loss occurs that reconciliation cannot explain, which this
+    operation is designed never to produce. Coverage of the queued request is
+    still asserted through the public queue state.
+    """
+    from graphify.generation import (
+        CodeUpdateRequest,
+        Corpus,
+        CorpusGraph,
+        GenerationPublished,
+    )
+    from graphify.generation import _corpus_graph as corpus_graph_module
+
+    output = tmp_path / "graphify-out"
+    (tmp_path / "forced.py").write_text(
+        "class Forced:\n    def run(self):\n        return 1\n",
+        encoding="utf-8",
+    )
+    _run_child(
+        tmp_path / "force.py",
+        """
+import sys
+from pathlib import Path
+
+from graphify.generation._coordination import _RequestCoordinator, _RequestedAuthority
+from graphify.generation._types import Corpus
+
+root, output = Path(sys.argv[1]), Path(sys.argv[2])
+_RequestCoordinator(Corpus(root=root, output=output)).accept(
+    "code-update",
+    changed_paths=("forced.py",),
+    authority=_RequestedAuthority(force=True),
+)
+""",
+        str(tmp_path),
+        str(output),
+    )
+    executed: list[CodeUpdateRequest] = []
+    real_execute = corpus_graph_module._execute_code_update
+
+    def record(corpus, request):
+        executed.append(request)
+        return real_execute(corpus, request)
+
+    monkeypatch.setattr(corpus_graph_module, "_execute_code_update", record)
+
+    outcome = CorpusGraph(Corpus(root=tmp_path, output=output)).code_update(
+        CodeUpdateRequest()
+    )
+
+    assert isinstance(outcome, GenerationPublished)
+    assert executed and all(request.force for request in executed)
+    assert _coordinator(tmp_path, output).pending() == ()
+
+
+# --- waiting until covered ----------------------------------------------------
+
+
+def test_wait_until_covered_returns_only_after_its_own_request_is_covered(
+    tmp_path,
+) -> None:
+    """Complete a foreground call only once its own accepted request is retired.
+
+    Work queued by processes that have already exited is covered by the same
+    generation, so the interactive caller's completion still means "the Corpus
+    now describes what I asked about" rather than "some rebuild happened".
+    """
+    from graphify.generation import (
+        CodeUpdateRequest,
+        Corpus,
+        CorpusGraph,
+        GenerationPublished,
+    )
+    from graphify.generation._coordination import _coalesce
+
+    output = tmp_path / "graphify-out"
+    for name in ("earlier", "later"):
+        (tmp_path / f"{name}.py").write_text(
+            f"class {name.capitalize()}:\n    def run(self):\n        return 1\n",
+            encoding="utf-8",
+        )
+        _run_child(
+            tmp_path / f"queue_{name}.py",
+            _QUEUE_CODE_UPDATE_SCRIPT,
+            str(tmp_path),
+            str(output),
+            f"{name}.py",
+        )
+    (tmp_path / "waiting.py").write_text(
+        "class Waiting:\n    def run(self):\n        return 1\n",
+        encoding="utf-8",
+    )
+
+    outcome = CorpusGraph(Corpus(root=tmp_path, output=output)).code_update(
+        CodeUpdateRequest((Path("waiting.py"),))
+    )
+
+    assert isinstance(outcome, GenerationPublished)
+    # Nothing is left accepted, so the waiting caller's own request was covered
+    # by the generation this call published rather than deferred to a later one.
+    assert _coordinator(tmp_path, output).pending() == ()
+    assert _coalesce(_coordinator(tmp_path, output).pending()) == ()
+    assert _graph_labels(output) >= {"Earlier", "Later", "Waiting"}
+
+
+def test_a_killed_executor_strands_no_coalesced_request(tmp_path) -> None:
+    """Leave every request of an interrupted plan for the next executor.
+
+    The killed executor had already coalesced three submitters' work into one
+    unit. Coverage happens only after the operation succeeds, so all three stay
+    durably accepted and the next executor covers them together.
+    """
+    from graphify.generation import (
+        CodeUpdateRequest,
+        Corpus,
+        CorpusGraph,
+        GenerationPublished,
+    )
+
+    output = tmp_path / "graphify-out"
+    for name in ("alpha", "beta", "gamma"):
+        (tmp_path / f"{name}.py").write_text(
+            f"class {name.capitalize()}:\n    def run(self):\n        return 1\n",
+            encoding="utf-8",
+        )
+        _run_child(
+            tmp_path / f"queue_{name}.py",
+            _QUEUE_CODE_UPDATE_SCRIPT,
+            str(tmp_path),
+            str(output),
+            f"{name}.py",
+        )
+    assert len(_plan(tmp_path, output)[0].covers) == 3
+    ready = tmp_path / "ready"
+    executor = _start_child(
+        tmp_path / "die.py",
+        """
+import sys
+import time
+from pathlib import Path
+
+from graphify.generation._coordination import (
+    _LeaseOutcome,
+    _RequestCoordinator,
+    _coalesce,
+)
+from graphify.generation._types import Corpus
+
+root, output, ready = (Path(argument) for argument in sys.argv[1:4])
+coordinator = _RequestCoordinator(Corpus(root=root, output=output))
+with coordinator.executor_lease() as lease:
+    assert lease is _LeaseOutcome.HELD, lease
+    assert len(_coalesce(coordinator.pending())[0].covers) == 3
+    ready.write_text("planned\\n", encoding="utf-8")
+    time.sleep(600)
+""",
+        str(tmp_path),
+        str(output),
+        str(ready),
+    )
+    _wait_for(ready.exists, description="the child to plan its coalesced work")
+    executor.kill()
+    executor.communicate(timeout=60)
+    assert len(_plan(tmp_path, output)[0].covers) == 3
+
+    outcome = CorpusGraph(Corpus(root=tmp_path, output=output)).code_update(
+        CodeUpdateRequest()
+    )
+
+    assert isinstance(outcome, GenerationPublished)
+    assert _graph_labels(output) >= {"Alpha", "Beta", "Gamma"}
+    assert _coordinator(tmp_path, output).pending() == ()
+    assert not (output / ".graphify_executor.json").exists()
 
 
 # --- durable acceptance -------------------------------------------------------
