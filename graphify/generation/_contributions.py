@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -14,6 +15,21 @@ from typing import Any, Iterator, Mapping
 # It is deliberately not a Corpus-relative path so it can never collide with a
 # real source, and it survives until a complete Full extraction replaces it.
 _UNATTRIBUTED_LEGACY_SOURCE = "@legacy/unattributed"
+
+# Evidence from a source system rather than a Corpus file — a database schema,
+# for instance — is keyed by the URL naming that system. The scheme is what
+# distinguishes such a key from a relative path, so it can never collide with a
+# real source, and it is preserved verbatim rather than being relativized
+# against a Corpus root it was never inside.
+_EXTERNAL_SOURCE_SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*://[^\\]+$")
+
+
+def _is_external_source_identity(source: Any) -> bool:
+    """Return whether a key names a source system rather than a Corpus file."""
+    return isinstance(source, str) and (
+        source == _UNATTRIBUTED_LEGACY_SOURCE
+        or bool(_EXTERNAL_SOURCE_SCHEME.match(source))
+    )
 
 
 class _InterpretationKind(str, Enum):
@@ -95,11 +111,12 @@ def _prepare_contributions(
     prepared: list[_PreparedContribution] = []
     seen: set[tuple[str, _InterpretationKind]] = set()
     for contribution in contributions:
-        # Reconciliation carries an existing unattributed legacy record forward
-        # verbatim; its key is intentionally not a Corpus-relative path.
+        # Reconciliation carries an existing unattributed legacy record, and a
+        # source system's own evidence, forward verbatim; neither key is a
+        # Corpus-relative path and relativizing one would reject it.
         source = (
-            _UNATTRIBUTED_LEGACY_SOURCE
-            if contribution.source == _UNATTRIBUTED_LEGACY_SOURCE
+            str(contribution.source)
+            if _is_external_source_identity(contribution.source)
             else _relative_source_identity(contribution.source, root)
         )
         key = (source, contribution.interpretation)
@@ -244,7 +261,7 @@ def _prepare_legacy_contributions(
     prepared: list[_PreparedContribution] = []
     for contribution in contributions:
         source = str(contribution.source)
-        if source != _UNATTRIBUTED_LEGACY_SOURCE:
+        if not _is_external_source_identity(source):
             source = _relative_source_identity(source, root)
         prepared.append(
             _PreparedContribution(
@@ -283,6 +300,10 @@ def _legacy_source_identity(source: Any, root: Path) -> str:
     """Return a portable legacy attribution or the explicit unattributed key."""
     if not isinstance(source, str) or not source.strip():
         return _UNATTRIBUTED_LEGACY_SOURCE
+    if _is_external_source_identity(source):
+        # A source system's address is a real attribution, so adopting a legacy
+        # graph keeps it rather than pooling that evidence as unattributed.
+        return source
     try:
         return _relative_source_identity(source, root)
     except (OSError, ValueError):
@@ -342,6 +363,11 @@ def _portable_items(
         copied = copy.deepcopy(dict(item))
         source_file = copied.get("source_file")
         if source_file:
+            if _is_external_source_identity(source_file):
+                # Evidence a source system described itself: the attribution is
+                # the system's own address, so there is nothing to relativize.
+                portable.append(copied)
+                continue
             try:
                 copied["source_file"] = _relative_source_identity(
                     str(source_file),
@@ -529,7 +555,13 @@ def _iter_contribution_ledger(path: Path) -> Iterator[_PreparedContribution]:
 
 
 def _source_identity_is_portable(source: str) -> bool:
-    """Return whether a ledger key is portable and root-relative."""
+    """Return whether a ledger key is portable and root-relative.
+
+    A source system's URL key is portable by construction — it names a system
+    rather than a location on this machine — so it is accepted as it stands.
+    """
+    if _is_external_source_identity(source):
+        return True
     if not source or source == "." or "\\" in source:
         return False
     posix_path = PurePosixPath(source)

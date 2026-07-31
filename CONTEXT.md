@@ -30,6 +30,26 @@ _Avoid_: Needs-update flag
 The authoritative structural or semantic graph evidence admitted from one corpus source before graph-wide deduplication.
 _Avoid_: Cache entry
 
+**Evidence source**:
+A canonical origin of graph evidence a full extraction may be asked to reconcile: the corpus filesystem, an external semantic provider, or a source system. Every requested evidence source must complete before the generation is committed.
+_Avoid_: Backend, Integration
+
+**Source system**:
+An evidence source that is not a corpus file, such as a PostgreSQL schema or a Cargo workspace. Its evidence is keyed by the system's own address, and corpus discovery is not authoritative about whether it still exists.
+_Avoid_: External file
+
+**Semantic provider**:
+The external system a full extraction asks to interpret corpus sources. It reports only the sources it interpreted completely; a source it omits was not interpreted.
+_Avoid_: LLM, Backend
+
+**Source evidence**:
+The graph evidence one evidence source reports for one corpus source. It becomes a source contribution once the owning operation admits it.
+_Avoid_: Result, Payload
+
+**Corpus build policy**:
+The recorded discovery shaping — extra exclusions, whether VCS ignore files are honored — that a graph generation was built under. Full extraction preserves it unless replacement or clearing is explicitly requested.
+_Avoid_: Config, Settings
+
 **Graph generation**:
 The mutually consistent graph and corpus state published by one completed full extraction, code update, or reclustering.
 _Avoid_: Output files

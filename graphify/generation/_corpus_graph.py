@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from graphify.generation._code_update import _execute_code_update
 from graphify.generation._coordination import (
@@ -10,14 +11,22 @@ from graphify.generation._coordination import (
     _AcceptedRequest,
     _CoalescedRequest,
     _LeaseOutcome,
+    _PolicyReplacement,
     _RequestCoordinator,
     _RequestedAuthority,
     _coalesce,
+)
+from graphify.generation._full_extraction import (
+    _execute_full_extraction,
+    _validate_sources,
 )
 from graphify.generation._publication import _Publication
 from graphify.generation._publisher import _Publisher
 from graphify.generation._types import (
     AlreadyCurrent,
+    BuildPolicy,
+    BuildPolicyRequest,
+    ClearBuildPolicy,
     CodeUpdateRequest,
     Completion,
     Corpus,
@@ -27,6 +36,7 @@ from graphify.generation._types import (
     OperationFailed,
     Queued,
     ReclusteringRequest,
+    ReplaceBuildPolicy,
     ReturnWhenQueued,
     TerminalOutcome,
     WaitUntilCovered,
@@ -36,6 +46,13 @@ _LEASE_HELD_ELSEWHERE = (
     "another process holds the Corpus executor lease; this request remains "
     "durably queued for the executor that covers it"
 )
+
+# What a Full-extraction executor genuinely covers today. It reconciles every
+# Corpus source, so it does the work an ordinary Code update would — but it
+# publishes a Raw generation, so it has not done a Reclustering's work and must
+# not retire a queued request asking for one. The entry widens when Reclustering
+# moves behind this module.
+_FULL_EXTRACTION_COVERS = frozenset({"full-extraction", "code-update"})
 
 
 class CorpusGraph:
@@ -62,17 +79,56 @@ class CorpusGraph:
         completion: Completion = WaitUntilCovered(),
         _publication: _Publication | None = None,
     ) -> TerminalOutcome:
-        """Publish the candidate prepared by the current Full extraction adapter.
+        """Reconcile every requested evidence source into one Graph generation.
 
-        ``_publication`` is the private migration handoff. Invalid calls fail
-        before acceptance; lifecycle preparation moves behind this method in a
-        later slice without changing the public request or outcome types. Until
-        it does, ``ReturnWhenQueued`` is refused rather than acknowledged: no
-        executor owns this operation, so a durable record would never be covered.
+        Called without ``_publication`` this owns the whole operation:
+        authoritative discovery under the active or explicitly replaced Corpus
+        policy, structural extraction, interpretation by the requested Semantic
+        provider, collection from every requested source system, and publication
+        — all under the one executor lease for the Corpus, and all completed
+        before anything is committed.
+
+        ``ReturnWhenQueued`` is refused: a request's evidence sources are live
+        in-process objects, so a durable record of one could never be carried out
+        by the executor that eventually drained it. The ``_publication`` handoff
+        remains only for compatibility adapters that have not yet been rerouted.
         """
         if not isinstance(request, FullExtractionRequest):
             raise TypeError("full_extraction requires FullExtractionRequest")
-        return self._complete(completion, _publication, operation="full-extraction")
+        if _publication is not None:
+            return self._complete(
+                completion,
+                _publication,
+                operation="full-extraction",
+            )
+        self._validate_completion(completion)
+        if isinstance(completion, ReturnWhenQueued):
+            raise ValueError(
+                "full-extraction cannot be durably queued: its evidence sources "
+                "are in-process adapters that no other executor could carry out"
+            )
+        # Rejected before acceptance rather than after: an impossible request
+        # must not become durable state something would later have to strand.
+        _validate_sources(request)
+        coordinator = _RequestCoordinator(self._corpus)
+        accepted = coordinator.accept(
+            "full-extraction",
+            changed_paths=request.changed_paths,
+            authority=_RequestedAuthority(
+                force=request.force,
+                policy_replacement=_policy_replacement(request.build_policy),
+            ),
+        )
+        return self._execute(
+            coordinator,
+            accepted,
+            operation="full-extraction",
+            covers=_FULL_EXTRACTION_COVERS,
+            run=lambda unit: _execute_full_extraction(
+                self._corpus,
+                _full_extraction_for(unit, request),
+            ),
+        )
 
     def code_update(
         self,
@@ -102,7 +158,16 @@ class CorpusGraph:
         )
         if isinstance(completion, ReturnWhenQueued):
             return Queued(request_id=accepted.request_id)
-        return self._execute_code_update(coordinator, accepted)
+        return self._execute(
+            coordinator,
+            accepted,
+            operation="code-update",
+            covers=coordinator.subsumed_by("code-update"),
+            run=lambda unit: _execute_code_update(
+                self._corpus,
+                _code_update_for(unit),
+            ),
+        )
 
     def reclustering(
         self,
@@ -120,20 +185,28 @@ class CorpusGraph:
             raise TypeError("reclustering requires ReclusteringRequest")
         return self._complete(completion, _publication, operation="reclustering")
 
-    def _execute_code_update(
+    def _execute(
         self,
         coordinator: _RequestCoordinator,
         accepted: _AcceptedRequest,
+        *,
+        operation: str,
+        covers: frozenset[str],
+        run: Callable[[_CoalescedRequest], TerminalOutcome],
     ) -> TerminalOutcome:
-        """Execute one accepted Code update as this Corpus's single executor.
+        """Execute one accepted request as this Corpus's single executor.
 
         The caller's own request is executed *through the queue* rather than
         beside it: it was made durable before the lease was contended for, so it
         is one of the accepted requests coalesced here. That is what lets this
         executor honor a ``force`` another process asked for, and it is why the
         returned outcome describes the work that covered this caller.
+
+        ``covers`` is the request kinds this executor's finished work genuinely
+        does, which is not always everything the operation nominally subsumes —
+        an operation that publishes only part of a generation must not retire a
+        queued request for the part it did not publish.
         """
-        kinds = coordinator.subsumed_by("code-update")
         with coordinator.executor_lease(until_covered=accepted) as lease:
             if lease is _LeaseOutcome.COVERED:
                 # Another executor published a generation covering this request
@@ -141,24 +214,37 @@ class CorpusGraph:
                 return AlreadyCurrent()
             if lease is _LeaseOutcome.UNAVAILABLE:
                 return OperationFailed(_LEASE_HELD_ELSEWHERE)
-            # Snapshot before executing: a Code update re-derives every source it
-            # owns from authoritative discovery, so it covers every request
-            # accepted before it started regardless of their path hints. Requests
-            # that arrive mid-run are deliberately left for the passes below.
+            # Snapshot before executing: these operations re-derive every source
+            # they own from authoritative discovery, so they cover every request
+            # accepted before they started regardless of their path hints.
+            # Requests that arrive mid-run are deliberately left for the passes
+            # below.
             primary = self._cover_pending(
                 coordinator,
-                coordinator.pending(operations=kinds),
+                coordinator.pending(operations=covers),
+                operation=operation,
+                run=run,
             )
             if not _advances_corpus_state(primary):
                 # A refusal or failure changed nothing, so the queued work stays
                 # accepted for whichever executor manages to cover it next.
                 return primary
             for _ in range(_LATE_ARRIVAL_PASSES):
-                late = coordinator.pending(operations=kinds)
+                # Only this operation's own late arrivals. A lesser request that
+                # turned up mid-run *could* be covered by re-running, but the
+                # coalesced unit would then name that lesser operation, and
+                # running this one for it would do — and charge for — work nobody
+                # asked for. It stays durably accepted for its own executor.
+                late = coordinator.pending(operations=frozenset({operation}))
                 if not late:
                     break
                 if not _advances_corpus_state(
-                    self._cover_pending(coordinator, late)
+                    self._cover_pending(
+                        coordinator,
+                        late,
+                        operation=operation,
+                        run=run,
+                    )
                 ):
                     # Whatever is still queued stays durably accepted rather than
                     # being retried until this process gives up on it.
@@ -169,16 +255,19 @@ class CorpusGraph:
         self,
         coordinator: _RequestCoordinator,
         pending: tuple[_AcceptedRequest, ...],
+        *,
+        operation: str,
+        run: Callable[[_CoalescedRequest], TerminalOutcome],
     ) -> TerminalOutcome:
-        """Run the coalesced Code-update work for ``pending`` and retire what it covers.
+        """Run the coalesced work for ``pending`` and retire what it covers.
 
-        ``pending`` is filtered to the request kinds a Code update covers, and
-        every such request is mutually compatible — hints and ``force`` both
-        union, and no other authority may be accepted for this operation — so
-        coalescing yields exactly one unit. That invariant is asserted rather
-        than worked around: a second unit would mean this executor had been
-        handed work it cannot perform, and retiring it would claim coverage
-        nothing earned.
+        ``pending`` is filtered to the request kinds this executor covers, and
+        coalescing folds them into one unit whenever their exclusive policies
+        agree. A second unit means two queued requests disagreed about something
+        that cannot be averaged — two different Corpus policies, say — and this
+        executor cannot perform both. That is reported rather than worked around:
+        performing one and retiring the other would claim coverage nothing
+        earned, so both stay durably accepted.
 
         The unit is retired only after the operation advanced Corpus state, so a
         failure leaves every request it would have covered durably accepted. An
@@ -188,13 +277,13 @@ class CorpusGraph:
         units = _coalesce(pending)
         if not units:
             return AlreadyCurrent()
-        if len(units) != 1 or units[0].operation != "code-update":
+        if len(units) != 1 or units[0].operation != operation:
             return OperationFailed(
-                "the Code-update executor was given queued work it cannot "
+                f"the {operation} executor was given queued work it cannot "
                 f"perform: {sorted({unit.operation for unit in units})}"
             )
         unit = units[0]
-        outcome = _execute_code_update(self._corpus, _code_update_for(unit))
+        outcome = run(unit)
         if _advances_corpus_state(outcome):
             coordinator.cover(unit.covers)
         return outcome
@@ -237,6 +326,61 @@ class CorpusGraph:
         """Reject a completion policy outside the agreed closed union."""
         if not isinstance(completion, (WaitUntilCovered, ReturnWhenQueued)):
             raise TypeError("completion must be WaitUntilCovered or ReturnWhenQueued")
+
+
+def _policy_replacement(
+    requested: BuildPolicyRequest | None,
+) -> _PolicyReplacement | None:
+    """Return the durable record of an explicitly requested Corpus policy.
+
+    Clearing and replacing-with-the-defaults record identically, because they
+    ask discovery for the same Corpus. The distinction that survives — whether
+    the recorded policy is rewritten or retired — matters only to the process
+    that asked, and that process executes its own request.
+    """
+    if isinstance(requested, ReplaceBuildPolicy):
+        return _PolicyReplacement(
+            excludes=tuple(requested.policy.excludes),
+            gitignore=requested.policy.gitignore,
+        )
+    if isinstance(requested, ClearBuildPolicy):
+        return _PolicyReplacement()
+    return None
+
+
+def _full_extraction_for(
+    unit: _CoalescedRequest,
+    request: FullExtractionRequest,
+) -> FullExtractionRequest:
+    """Return the Full extraction one coalesced unit asks this executor to run.
+
+    Hints, ``force``, and the requested Corpus policy come from the unit, so
+    authority another process asked for is honored rather than dropped. The
+    evidence sources come from this process's own request: they are live
+    adapters — an open provider, a DSN a caller resolved — that a durable record
+    could not carry, which is also why a Full extraction is never acknowledged as
+    merely queued.
+    """
+    replacement = unit.authority.policy_replacement
+    if replacement is None:
+        build_policy = None
+    elif isinstance(request.build_policy, ClearBuildPolicy) and replacement == (
+        _PolicyReplacement()
+    ):
+        build_policy = request.build_policy
+    else:
+        build_policy = ReplaceBuildPolicy(
+            BuildPolicy(
+                excludes=replacement.excludes,
+                gitignore=replacement.gitignore,
+            )
+        )
+    return FullExtractionRequest(
+        sources=request.sources,
+        build_policy=build_policy,
+        changed_paths=tuple(Path(hint) for hint in unit.changed_paths),
+        force=unit.authority.force,
+    )
 
 
 def _code_update_for(unit: _CoalescedRequest) -> CodeUpdateRequest:

@@ -28,7 +28,7 @@ Each stage is a single function in its own module. They communicate through plai
 | `validate.py` | `validate_extraction(data)` | extraction dict → raises on schema errors |
 | `serve.py` | `start_server(graph_path)` | graph file path → MCP stdio server |
 | `watch.py` | `watch(root)` | directory → submits a code update on change; also hosts the shared code-update adapter helpers the CLI and hooks call |
-| `generation/` | `CorpusGraph(corpus).code_update(...)` | request → published graph generation |
+| `generation/` | `CorpusGraph(corpus).full_extraction(...)` / `.code_update(...)` | request → published graph generation |
 | `benchmark.py` | `run_benchmark(graph_path)` | graph file → corpus vs subgraph token comparison |
 
 ## Graph generation ownership
@@ -60,7 +60,37 @@ keeps working unchanged.
 
 A code update publishes a *raw* graph generation: contributions, `graph.json`,
 and the manifest. Community identity, labels, analysis, and `GRAPH_REPORT.md`
-are republished by reclustering, which is a separate operation.
+are republished by reclustering, which is a separate operation. Full extraction
+publishes a raw generation too, for the same reason: clustering is reclustering's
+work, so an extraction that produced one would be publishing a second operation's
+output.
+
+### Full extraction and its evidence sources
+
+Full extraction owns the interpreting half of the lifecycle. A request names the
+evidence sources beyond the corpus filesystem — a semantic provider, a PostgreSQL
+schema, a Cargo workspace, Google Workspace shortcuts — and every one of them
+must finish before anything is staged, so a generation never describes some
+sources at one moment of the corpus and the rest at another.
+
+Two seams are public because the systems behind them genuinely are external:
+`SemanticProvider`, which interprets documents, and the source-system requests
+that name a database or workspace. Discovery, caches, structural extraction, and
+publication stay implementation details.
+
+A source's contribution is replaced atomically: either the run produced that
+source's complete evidence, or the prior contribution stands. A source whose
+interpretation did not complete keeps its last complete evidence — marked stale —
+or keeps having none, and stays pending either way; any fragment the attempt
+produced belongs in the provider's cache, never in the ledger. Only a run that
+interpreted every live semantic source may clear pending state.
+
+Full extraction preserves the active corpus build policy unless the request
+carries an explicit replacement or clearing.
+
+The `graphify extract` CLI is still an unrerouted adapter: it prepares a
+candidate and hands it over privately. Rerouting it is issue #12, and refusing an
+incomplete extraction by default is issue #11.
 
 ## Extraction output schema
 
