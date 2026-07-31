@@ -41,9 +41,14 @@ picks a completion policy, renders the terminal outcome, and does nothing else.
 
 | Entrypoint | Completion | Notes |
 |------------|------------|-------|
+| `graphify extract` | `WaitUntilCovered` | translates flags into one full-extraction request |
 | `graphify update` | `WaitUntilCovered` | returns only once the request is covered |
 | `watch` | `WaitUntilCovered` | submits the debounced batch as one request |
 | git hooks | `ReturnWhenQueued`, then executes | the change set is durable before any work starts |
+
+A full extraction is never acknowledged as merely queued: its evidence sources
+are live in-process objects — an open provider, a DSN a caller resolved — that a
+durable queue record could not carry out on another process's behalf.
 
 ### Compatibility transition window
 
@@ -78,6 +83,25 @@ Two seams are public because the systems behind them genuinely are external:
 that name a database or workspace. Discovery, caches, structural extraction, and
 publication stay implementation details.
 
+`graphify.semantic_provider.LlmSemanticProvider` is the production implementation
+of the first seam. It resolves a backend only when there is something to
+interpret — which is what keeps a code-only corpus free — consults its own
+content-keyed cache, and reports a source as interpreted only when the run
+produced its complete evidence: a truncated, omitted, or failed source is left
+out of the answer entirely.
+
+### Observing an operation
+
+`ObservationAdapter` is the one public seam that receives rather than answers:
+the two above admit evidence from external systems, this one carries progress
+back out to whoever is watching. An operation reports coarse ordered lifecycle
+facts —
+`CorpusDiscovered`, `SourcesInterpreted`, `EvidenceCollected`,
+`PublicationStarted` — so an adapter can render progress without private
+function names or preformatted messages, and without a duplicate of the terminal
+outcome. An adapter that raises is warned about and dropped for the rest of the
+operation: rendering has no authority over generation work.
+
 A source's contribution is replaced atomically: either the run produced that
 source's complete evidence, or the prior contribution stands. A source whose
 interpretation did not complete keeps its last complete evidence — marked stale —
@@ -111,10 +135,27 @@ also be the one that can publish a partial result. The durable request queue
 enforces that: a code update claiming partial-publication authority is rejected
 before it is recorded.
 
-The `graphify extract` CLI is still an unrerouted adapter: it prepares a
-candidate and hands it over privately, so its own `--allow-partial` flag still
-maps to the legacy shrink override rather than to this authority. Rerouting it is
-issue #12.
+`graphify extract` translates the two authorities independently: `--allow-partial`
+is partial-publication authority and nothing else, and `--force` re-interprets
+every semantic source and authorizes a smaller graph, without ever letting an
+unfinished run publish.
+
+One flag lost its effect in the move: `--dedup-llm` is still accepted, but a
+graph generation is materialized from its source contributions with exact
+node/edge deduplication only, so LLM-assisted fuzzy entity merging across
+sources no longer runs on any extraction path. (Code update already published
+that way, so a single `graphify update` had been collapsing fuzzy-merged graphs
+back since it moved behind the owner.) The flag prints a note saying so.
+
+### What `graphify extract` still prepares itself
+
+One step of the command is not yet the operation's: after full extraction has
+published the raw generation, the clustered default reads that published graph,
+clusters it, and hands the candidate to `CorpusGraph.reclustering` through the
+documented compatibility handoff. That keeps the owning module the only canonical
+writer while clustering is still adapter-prepared. Issue #13 moves it, and this
+step retires with it. `--no-cluster` skips it entirely, which is exactly what a
+raw generation already is.
 
 ## Extraction output schema
 

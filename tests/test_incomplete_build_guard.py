@@ -1,243 +1,190 @@
-"""Tests for the incomplete-build shrink-guard on `graphify extract`.
+"""Adapter tests for how `graphify extract` translates publication authority.
 
-A full build writes the graph with `to_json(..., force=True)`, which bypasses the
-#479 shrink guard. When this run's extraction was incomplete (an AST pass crashed
-or some semantic chunks failed), forcing the write can silently overwrite a good
-complete graph with a smaller partial one. The build now drops back to the shrink
-guard (force=False) on an incomplete run — unless `--allow-partial` is passed —
-and exits non-zero (before writing the manifest) if the guard refuses.
+Full extraction refuses to replace the active Graph generation from work that
+did not finish, and the two authorities that can change what a run may publish —
+partial publication and ``force`` — are deliberately separate. Those rules live
+in ``graphify.generation`` and are tested there against the operation. What is
+tested here is the CLI's half: that ``--allow-partial`` and ``--force`` reach the
+request independently, and that the terminal outcome becomes the exit code and
+the stream a script reads.
+
+The backend call is the only substitution — it is the one part that would reach
+a paid network service — and it is substituted at the same function the
+production Semantic provider calls.
 """
 from __future__ import annotations
+
+import json
 
 import pytest
 
 import graphify.__main__ as mainmod
 
 
-def _make_docs_corpus(tmp_path):
-    # Docs-only corpus: no code files, so AST extraction is skipped and the only
-    # driver of incompleteness is the (stubbed) semantic chunk run.
+def _docs_corpus(tmp_path):
+    """Return a documents-only Corpus, so interpretation is the whole run."""
     (tmp_path / "README.md").write_text("# Notes\nThe entry point overview.\n")
     (tmp_path / "GUIDE.md").write_text("# Guide\nHow to use the thing.\n")
     return tmp_path
 
 
-def _seed_to_json_recorder(monkeypatch, *, returns=True):
-    """Patch export.to_json to record the ``force`` it was called with and return
-    a fixed bool (True = wrote, False = shrink guard refused)."""
-    from graphify.export import to_json as production_to_json
+def _arm_extract(monkeypatch, tmp_path, *, interpret_all: bool, extra_argv=()):
+    """Point the CLI at a Corpus whose interpretation completes, or does not.
 
-    rec = {"called": False, "force": None}
-
-    def _stub(G, communities, output_path, *, force=False, **kwargs):
-        """Record policy while preserving production serialization on success."""
-        rec["called"] = True
-        rec["force"] = force
-        if not returns:
-            return False
-        return production_to_json(
-            G,
-            communities,
-            output_path,
-            force=True,
-            **kwargs,
-        )
-
-    monkeypatch.setattr("graphify.export.to_json", _stub)
-    return rec
-
-
-def _arm_extract(monkeypatch, tmp_path, *, chunk_total, chunk_succeeded, extra_argv=()):
-    corpus = _make_docs_corpus(tmp_path)
+    ``interpret_all=False`` reproduces the shape a real backend reports when it
+    answers about one document and silently omits another: the omitted file
+    comes back in ``uncovered_files``, which is how "not completely interpreted"
+    is expressed.
+    """
+    corpus = _docs_corpus(tmp_path)
     out_dir = tmp_path / "out"
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
 
     def _stub_corpus(paths, **kwargs):
+        """Interpret README.md, and GUIDE.md only when the run is complete."""
         on_chunk = kwargs.get("on_chunk_done")
-        if on_chunk:
-            for i in range(chunk_succeeded):
-                on_chunk(i, chunk_total, {"nodes": [], "edges": [], "hyperedges": []})
-        return {
-            "nodes": [{"id": "s1", "source_file": str(corpus / "README.md"),
-                       "file_type": "document", "label": "Notes"}],
-            "edges": [], "hyperedges": [], "input_tokens": 10, "output_tokens": 5,
+        result = {
+            "nodes": [
+                {
+                    "id": "readme_notes",
+                    "source_file": str(corpus / "README.md"),
+                    "file_type": "document",
+                    "label": "Notes",
+                }
+            ],
+            "edges": [],
+            "hyperedges": [],
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "failed_chunks": 0,
+            "uncovered_files": [],
         }
-
-    monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _stub_corpus)
-    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
-    monkeypatch.setattr(
-        mainmod.sys, "argv",
-        ["graphify", "extract", str(corpus), "--backend", "claude",
-         "--out", str(out_dir), *extra_argv],
-    )
-    return out_dir
-
-
-def test_partial_extraction_refuses_to_shrink_existing_graph(monkeypatch, tmp_path, capsys):
-    # 1 of 3 chunks succeeded -> incomplete; the shrink guard refuses (returns False).
-    rec = _seed_to_json_recorder(monkeypatch, returns=False)
-    out_dir = _arm_extract(monkeypatch, tmp_path, chunk_total=3, chunk_succeeded=1)
-
-    with pytest.raises(SystemExit) as exc:
-        mainmod.main()
-
-    assert exc.value.code == 1
-    assert rec["called"] and rec["force"] is False, "incomplete build must not force the write"
-    err = capsys.readouterr().err
-    assert "Refusing to overwrite" in err
-    # The manifest must not be stamped for a graph we declined to write.
-    assert not (out_dir / "graphify-out" / "manifest.json").exists()
-
-
-def test_partial_extraction_writes_when_not_shrinking(monkeypatch, tmp_path):
-    # Incomplete run, but the new graph is not smaller -> the guard permits the
-    # write. force is still False (guard active), and the CLI does not exit 1.
-    rec = _seed_to_json_recorder(monkeypatch, returns=True)
-    _arm_extract(monkeypatch, tmp_path, chunk_total=3, chunk_succeeded=1)
-
-    mainmod.main()  # no SystemExit
-
-    assert rec["called"] and rec["force"] is False
-
-
-def test_allow_partial_forces_write_despite_incomplete(monkeypatch, tmp_path):
-    rec = _seed_to_json_recorder(monkeypatch, returns=True)
-    _arm_extract(monkeypatch, tmp_path, chunk_total=3, chunk_succeeded=1,
-                 extra_argv=["--allow-partial"])
-
-    mainmod.main()
-
-    assert rec["called"] and rec["force"] is True, "--allow-partial must restore force=True"
-
-
-def test_complete_extraction_keeps_force_write(monkeypatch, tmp_path):
-    # All chunks succeeded -> a complete build legitimately keeps force=True so a
-    # genuine dedup/deletion shrink still overwrites.
-    rec = _seed_to_json_recorder(monkeypatch, returns=True)
-    _arm_extract(monkeypatch, tmp_path, chunk_total=1, chunk_succeeded=1)
-
-    mainmod.main()
-
-    assert rec["called"] and rec["force"] is True
-
-
-def _seed_existing_graph(gout, n):
-    import json
-    gout.mkdir(parents=True, exist_ok=True)
-    (gout / "graph.json").write_text(
-        json.dumps({"nodes": [{"id": f"keep{i}", "label": f"k{i}"} for i in range(n)],
-                    "links": []}),
-        encoding="utf-8",
-    )
-
-
-def _arm_no_cluster(monkeypatch, tmp_path, *, extra_argv=()):
-    corpus = _make_docs_corpus(tmp_path)
-    out_dir = tmp_path / "out"
-    gout = out_dir / "graphify-out"
-    _seed_existing_graph(gout, 5)  # existing complete graph
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
-
-    def _stub_corpus(paths, **kwargs):
-        on_chunk = kwargs.get("on_chunk_done")
+        if interpret_all:
+            result["nodes"].append(
+                {
+                    "id": "guide_howto",
+                    "source_file": str(corpus / "GUIDE.md"),
+                    "file_type": "document",
+                    "label": "Guide",
+                }
+            )
+        else:
+            result["uncovered_files"] = [str(corpus / "GUIDE.md")]
+            result["failed_chunks"] = 1
         if on_chunk:
-            on_chunk(0, 3, {"nodes": [], "edges": [], "hyperedges": []})  # 1 of 3 -> partial
-        return {"nodes": [{"id": "s1", "source_file": str(corpus / "README.md"),
-                           "file_type": "document", "label": "Notes"}],
-                "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1}
+            on_chunk(0, 1, result)
+        return result
 
     monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _stub_corpus)
     monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
     monkeypatch.setattr(
-        mainmod.sys, "argv",
-        ["graphify", "extract", str(corpus), "--backend", "claude", "--no-cluster",
-         "--out", str(out_dir), *extra_argv],
+        mainmod.sys,
+        "argv",
+        [
+            "graphify",
+            "extract",
+            str(corpus),
+            "--backend",
+            "claude",
+            "--no-cluster",
+            "--out",
+            str(out_dir),
+            *extra_argv,
+        ],
     )
-    return gout / "graph.json"
+    return out_dir / "graphify-out"
 
 
-def test_no_cluster_incomplete_build_refuses_to_shrink(tmp_path, monkeypatch, capsys):
-    # --force: the non-incremental raw-dump path, where the shrink guard is the
-    # only thing standing between a partial 1-node extraction and the existing
-    # complete 5-node graph. (Incremental runs merge the existing graph forward
-    # first — #2169 — so a partial run no longer shrinks there; see below.)
-    import json
-    graph = _arm_no_cluster(monkeypatch, tmp_path, extra_argv=["--force"])
-
-    with pytest.raises(SystemExit) as exc:
+def _run() -> int:
+    """Run the CLI and return the exit code it chose."""
+    with pytest.raises(SystemExit) as exit_status:
         mainmod.main()
-
-    assert exc.value.code == 1
-    assert "Refusing to overwrite" in capsys.readouterr().err
-    # The existing 5-node graph is untouched — the partial 1-node graph was refused.
-    assert len(json.loads(graph.read_text())["nodes"]) == 5
+    return int(exit_status.value.code or 0)
 
 
-def test_no_cluster_incremental_incomplete_build_carries_existing_nodes(
-    tmp_path, monkeypatch
+def _node_ids(graph_path) -> set[str]:
+    """Return the node identities in the published graph."""
+    return {
+        node["id"]
+        for node in json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]
+    }
+
+
+def test_incomplete_interpretation_refuses_and_exits_nonzero(
+    monkeypatch, tmp_path, capsys
 ):
-    """#2169: an INCREMENTAL --no-cluster run merges the existing graph forward,
-    so even an incomplete extraction does not shrink the graph — the existing
-    nodes are carried and this run's partial chunk is added, no guard refusal."""
-    import json
-    graph = _arm_no_cluster(monkeypatch, tmp_path)
+    """Publish nothing, and say why, when a source was not interpreted."""
+    out = _arm_extract(monkeypatch, tmp_path, interpret_all=False)
 
-    with pytest.raises(SystemExit) as exc:
-        mainmod.main()
+    assert _run() == 1
 
-    assert exc.value.code == 0  # the raw --no-cluster path exits 0 on success
-    ids = {n["id"] for n in json.loads(graph.read_text())["nodes"]}
-    assert {f"keep{i}" for i in range(5)} <= ids, ids
-    assert "s1" in ids, ids
+    assert "interpretation was incomplete" in capsys.readouterr().err
+    # Nothing at all was published: a refused run leaves the Corpus as it was,
+    # and in particular does not stamp a manifest for a graph it declined.
+    assert not (out / "graph.json").exists()
+    assert not (out / "manifest.json").exists()
 
 
-def test_no_cluster_allow_partial_overwrites(tmp_path, monkeypatch):
-    import json
-    graph = _arm_no_cluster(
-        monkeypatch, tmp_path, extra_argv=["--force", "--allow-partial"]
+def test_force_alone_does_not_authorize_an_incomplete_publication(
+    monkeypatch, tmp_path, capsys
+):
+    """Keep the two authorities separate: force is not partial authority."""
+    out = _arm_extract(monkeypatch, tmp_path, interpret_all=False, extra_argv=["--force"])
+
+    assert _run() == 1
+
+    assert "interpretation was incomplete" in capsys.readouterr().err
+    assert not (out / "graph.json").exists()
+
+
+def test_allow_partial_publishes_the_sources_that_completed(monkeypatch, tmp_path):
+    """Commit the interpreted source, and leave the other one pending."""
+    out = _arm_extract(
+        monkeypatch, tmp_path, interpret_all=False, extra_argv=["--allow-partial"]
     )
 
-    with pytest.raises(SystemExit) as exc:
-        mainmod.main()
+    assert _run() == 0
 
-    assert exc.value.code == 0  # the raw --no-cluster path exits 0 on success
-    assert len(json.loads(graph.read_text())["nodes"]) == 1
+    assert "readme_notes" in _node_ids(out / "graph.json")
+    assert "guide_howto" not in _node_ids(out / "graph.json")
+    # The source that was not interpreted is disclosed as outstanding work
+    # rather than being presented as done.
+    assert (out / "needs_update").is_file()
 
 
-def test_no_cluster_incomplete_build_fails_closed_on_malformed_existing_graph(
-    tmp_path, monkeypatch, capsys
+def test_a_complete_interpretation_needs_no_authority(monkeypatch, tmp_path):
+    """Publish a finished run without any of the safety authorities."""
+    out = _arm_extract(monkeypatch, tmp_path, interpret_all=True)
+
+    assert _run() == 0
+
+    assert {"readme_notes", "guide_howto"} <= _node_ids(out / "graph.json")
+    assert not (out / "needs_update").is_file()
+
+
+def test_an_incomplete_run_preserves_the_active_generation(monkeypatch, tmp_path):
+    """Leave a published generation exactly as it was when a later run fails."""
+    out = _arm_extract(monkeypatch, tmp_path, interpret_all=True)
+    assert _run() == 0
+    published = (out / "graph.json").read_bytes()
+
+    # --force so the second run re-interprets instead of being served the first
+    # run's cached answers, which would make it complete again.
+    _arm_extract(monkeypatch, tmp_path, interpret_all=False, extra_argv=["--force"])
+    assert _run() == 1
+
+    assert (out / "graph.json").read_bytes() == published
+
+
+def test_an_unreadable_active_graph_is_refused_not_overwritten(
+    monkeypatch, tmp_path, capsys
 ):
-    """A present-but-unparseable existing graph.json (corrupt or mid-write) could
-    be hiding a complete graph, so an incomplete --no-cluster build must refuse
-    to overwrite it — matching to_json's #479 fail-closed handling, not the
-    fail-open 'proceed when we can't count' path. --force: the non-incremental
-    raw-dump path (the incremental path fails even earlier, at the forward
-    merge — see the test below)."""
-    graph = _arm_no_cluster(monkeypatch, tmp_path, extra_argv=["--force"])
-    graph.write_text("{corrupt json", encoding="utf-8")  # non-empty, unparseable
+    """Refuse to build on state that cannot be validated, and keep it intact."""
+    out = _arm_extract(monkeypatch, tmp_path, interpret_all=True)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "graph.json").write_text("{corrupt json", encoding="utf-8")
 
-    with pytest.raises(SystemExit) as exc:
-        mainmod.main()
+    assert _run() == 1
 
-    assert exc.value.code == 1
-    assert "unparseable" in capsys.readouterr().err
-    # The corrupt file is left untouched rather than clobbered by the partial build.
-    assert graph.read_text() == "{corrupt json"
-
-
-def test_no_cluster_incremental_malformed_existing_graph_refuses_merge(
-    tmp_path, monkeypatch, capsys
-):
-    """#2169: an incremental --no-cluster run must hard-fail on an unparseable
-    existing graph.json (build_merge's message) instead of raw-dumping this
-    run's chunks over it."""
-    graph = _arm_no_cluster(monkeypatch, tmp_path)
-    graph.write_text("{corrupt json", encoding="utf-8")  # non-empty, unparseable
-
-    with pytest.raises(SystemExit) as exc:
-        mainmod.main()
-
-    assert exc.value.code == 1
-    assert "Cannot read" in capsys.readouterr().err
-    # The corrupt file is left untouched rather than clobbered.
-    assert graph.read_text() == "{corrupt json"
+    assert "cannot validate" in capsys.readouterr().err.lower()
+    assert (out / "graph.json").read_text(encoding="utf-8") == "{corrupt json"

@@ -128,6 +128,45 @@ def test_a_requested_source_that_cannot_complete_commits_nothing(tmp_path) -> No
     assert (output / "graph.json").read_bytes() == published
 
 
+def test_a_graph_rewritten_outside_the_owner_is_restored_from_authority(
+    tmp_path,
+) -> None:
+    """Republish the graph view when it no longer materializes its own ledger.
+
+    An unchanged Corpus normally publishes nothing: the ledger already describes
+    it, so ``graph.json`` is deliberately left alone. That licence holds only
+    while the graph on disk still is the ledger's view. A graph something else
+    rewrote is not, and this run has just reconciled every source, so it
+    republishes the view it derived — evidence no source produced does not
+    survive by having been written into the view directly, and the Corpus is not
+    left permanently unable to publish either.
+    """
+    from graphify.generation import FullExtractionRequest, GenerationPublished
+
+    owner, output = _corpus(tmp_path)
+    assert isinstance(owner.full_extraction(FullExtractionRequest()), GenerationPublished)
+
+    graph_path = output / "graph.json"
+    payload = json.loads(graph_path.read_text(encoding="utf-8"))
+    payload["nodes"].append(
+        {"id": "external::note", "label": "note", "source_file": "guide.md"}
+    )
+    graph_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    outcome = owner.full_extraction(FullExtractionRequest())
+
+    from graphify.generation import AlreadyCurrent, CorpusStateAdvanced
+
+    assert isinstance(outcome, GenerationPublished)
+    assert "external::note" not in _node_ids(output)
+    assert _has_record(output, "service.py", "structural")
+    # And the Corpus is current again rather than stuck on the same conflict.
+    assert isinstance(
+        owner.full_extraction(FullExtractionRequest()),
+        (AlreadyCurrent, CorpusStateAdvanced),
+    )
+
+
 def test_a_source_systems_evidence_survives_a_later_code_update(tmp_path) -> None:
     """Keep database evidence a filesystem scan can say nothing about.
 
@@ -152,7 +191,9 @@ def test_a_source_systems_evidence_survives_a_later_code_update(tmp_path) -> Non
     from graphify.generation._publication import _Publication
 
     owner, output = _corpus(tmp_path)
-    schema = "postgresql://db.example/orders"
+    # The spelling the PostgreSQL introspector actually produces: it builds the
+    # address with PurePosixPath, which collapses the scheme's double slash.
+    schema = "postgresql:/db.example/orders"
     seeded = owner.full_extraction(
         FullExtractionRequest(),
         _publication=_Publication(

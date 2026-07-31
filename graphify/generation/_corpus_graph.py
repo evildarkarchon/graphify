@@ -20,8 +20,11 @@ from graphify.generation._full_extraction import (
     _execute_full_extraction,
     _validate_sources,
 )
+from graphify.generation._observations import _Observations
 from graphify.generation._publication import _Publication
 from graphify.generation._publisher import _Publisher
+from graphify.generation._reconciliation import _active_build_policy
+from graphify.generation._transaction import _PublicationTransaction
 from graphify.generation._types import (
     AlreadyCurrent,
     BuildPolicy,
@@ -30,16 +33,17 @@ from graphify.generation._types import (
     CodeUpdateRequest,
     Completion,
     Corpus,
-    CorpusStateAdvanced,
     FullExtractionRequest,
-    GenerationPublished,
+    ObservationAdapter,
     OperationFailed,
+    PublicationRefused,
     Queued,
     ReclusteringRequest,
     ReplaceBuildPolicy,
     ReturnWhenQueued,
     TerminalOutcome,
     WaitUntilCovered,
+    covers_the_request,
 )
 
 _LEASE_HELD_ELSEWHERE = (
@@ -72,11 +76,34 @@ class CorpusGraph:
         """Return the immutable Corpus identity bound to this owner."""
         return self._corpus
 
+    def active_build_policy(self) -> BuildPolicy:
+        """Return the Corpus policy the active Graph generation was built under.
+
+        An adapter that lets a user change *part* of the Corpus shape — a new
+        exclude while the recorded ignore-file setting stands — has to say what
+        the whole replacement is, because replacement is whole by design. This
+        is how it asks, rather than by reading the recorded policy itself: the
+        artifact holding it is a canonical one this module owns, and a second
+        reader of it would be a second opinion about what the Corpus is.
+
+        Raises ``ValueError`` when a recorded policy cannot be read. Falling back
+        to the documented defaults would silently re-include the very paths the
+        Corpus was told to exclude, which is the one answer worse than none.
+        """
+        active = _active_build_policy(
+            _PublicationTransaction.active_layout(self._corpus)
+        )
+        if isinstance(active, PublicationRefused):
+            raise ValueError(active.reason)
+        excludes, gitignore = active
+        return BuildPolicy(excludes=tuple(excludes), gitignore=gitignore)
+
     def full_extraction(
         self,
         request: FullExtractionRequest,
         *,
         completion: Completion = WaitUntilCovered(),
+        observer: ObservationAdapter | None = None,
         _publication: _Publication | None = None,
     ) -> TerminalOutcome:
         """Reconcile every requested evidence source into one Graph generation.
@@ -87,6 +114,11 @@ class CorpusGraph:
         provider, collection from every requested source system, and publication
         — all under the one executor lease for the Corpus, and all completed
         before anything is committed.
+
+        ``observer`` is told the ordered lifecycle facts a caller renders
+        progress from. It has no authority over the operation: it is never
+        consulted, and one that raises is warned about and dropped rather than
+        being allowed to fail work it was only watching.
 
         ``ReturnWhenQueued`` is refused: a request's evidence sources are live
         in-process objects, so a durable record of one could never be carried out
@@ -120,6 +152,7 @@ class CorpusGraph:
                 policy_replacement=_policy_replacement(request.build_policy),
             ),
         )
+        observations = _Observations(observer)
         return self._execute(
             coordinator,
             accepted,
@@ -128,6 +161,7 @@ class CorpusGraph:
             run=lambda unit: _execute_full_extraction(
                 self._corpus,
                 _full_extraction_for(unit, request),
+                observations,
             ),
         )
 
@@ -399,13 +433,10 @@ def _code_update_for(unit: _CoalescedRequest) -> CodeUpdateRequest:
 
 
 def _advances_corpus_state(outcome: TerminalOutcome) -> bool:
-    """Return whether an outcome means the Corpus is current with the request.
+    """Return whether queued work this outcome would retire was really done.
 
-    Only these three outcomes prove a generation now describes the Corpus the
-    queued requests were asking about; a refusal, failure, or cancellation must
-    leave them accepted so the work is not silently dropped.
+    The same reading of the union every adapter uses, named here for what the
+    executor does with it: a refusal, failure, or cancellation must leave the
+    accepted requests queued so the work is not silently dropped.
     """
-    return isinstance(
-        outcome,
-        (GenerationPublished, CorpusStateAdvanced, AlreadyCurrent),
-    )
+    return covers_the_request(outcome)

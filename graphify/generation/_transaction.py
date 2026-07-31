@@ -203,6 +203,46 @@ class _PublicationTransaction:
             return False
 
     @classmethod
+    def graph_materializes_contributions(
+        cls,
+        graph_path: Path,
+        ledger_path: Path,
+    ) -> bool:
+        """Return whether one published graph still materializes one ledger.
+
+        The comparison is topological — node identities, directed connectivity,
+        and hyperedges — because a clustered generation legitimately carries
+        community metadata a raw materialization does not.
+
+        An operation asks this before concluding it has nothing to publish: an
+        unchanged ledger only means the graph may be left alone if the graph on
+        disk still *is* that ledger's view of the Corpus. False for anything it
+        cannot read or compare, which is the safe answer — it makes the caller
+        republish the view from authority rather than trust a file it could not
+        verify.
+        """
+        try:
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+            contributions = tuple(_iter_contribution_ledger(ledger_path))
+            materialized = _materialize_graph_data(
+                contributions,
+                multigraph=bool(graph.get("multigraph", False)),
+            )
+            graph_edges = graph.get("links", graph.get("edges", []))
+            if not isinstance(graph_edges, list):
+                return False
+            return (
+                cls._node_id_counts(graph["nodes"])
+                == cls._node_id_counts(materialized["nodes"])
+                and cls._edge_topology_counts(graph_edges)
+                == cls._edge_topology_counts(materialized["links"])
+                and cls._canonical_items(graph.get("hyperedges", []))
+                == cls._canonical_items(materialized["hyperedges"])
+            )
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            return False
+
+    @classmethod
     def recover(cls, corpus: Corpus) -> PublicationRefused | None:
         """Finish or roll back the one durable transaction for ``corpus``."""
         output = corpus.output
@@ -842,36 +882,23 @@ class _PublicationTransaction:
             return not require_pair
         if not graph_present:
             return True
-        graph_path = cls._path_for_record(
-            base,
-            output,
-            _CanonicalArtifact.GRAPH.value,
-            graph_record,
-            flat=flat,
-        )
-        ledger_path = cls._path_for_record(
-            base,
-            output,
-            _CanonicalArtifact.CONTRIBUTIONS.value,
-            ledger_record,
-            flat=flat,
-        )
-        graph = json.loads(graph_path.read_text(encoding="utf-8"))
-        contributions = tuple(_iter_contribution_ledger(ledger_path))
-        materialized = _materialize_graph_data(
-            contributions,
-            multigraph=bool(graph.get("multigraph", False)),
-        )
-        graph_edges = graph.get("links", graph.get("edges", []))
-        if not isinstance(graph_edges, list):
-            return False
-        return (
-            cls._node_id_counts(graph["nodes"])
-            == cls._node_id_counts(materialized["nodes"])
-            and cls._edge_topology_counts(graph_edges)
-            == cls._edge_topology_counts(materialized["links"])
-            and cls._canonical_items(graph.get("hyperedges", []))
-            == cls._canonical_items(materialized["hyperedges"])
+        # One comparison implementation, shared with the check an operation runs
+        # before deciding an unchanged ledger means the graph may be left alone.
+        return cls.graph_materializes_contributions(
+            cls._path_for_record(
+                base,
+                output,
+                _CanonicalArtifact.GRAPH.value,
+                graph_record,
+                flat=flat,
+            ),
+            cls._path_for_record(
+                base,
+                output,
+                _CanonicalArtifact.CONTRIBUTIONS.value,
+                ledger_record,
+                flat=flat,
+            ),
         )
 
     @staticmethod

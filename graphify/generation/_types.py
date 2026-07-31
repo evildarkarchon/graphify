@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Protocol, TypeAlias, runtime_checkable
 
@@ -267,3 +268,112 @@ TerminalOutcome: TypeAlias = (
     | OperationFailed
     | Cancelled
 )
+
+
+def covers_the_request(outcome: TerminalOutcome) -> bool:
+    """Return whether an outcome means the Corpus is current with the request.
+
+    Only these three prove that a published Graph generation now describes the
+    Corpus the caller asked about — whether this request produced it, only
+    advanced Corpus state, or found the active generation already covering it.
+    Every other outcome left the request uncovered, which is what the exit codes,
+    the legacy booleans, and the queue's retire-what-was-covered rule all mean by
+    failure. One reading of the union, so an adapter and the executor cannot
+    disagree about whether the work happened.
+    """
+    return isinstance(
+        outcome,
+        (GenerationPublished, CorpusStateAdvanced, AlreadyCurrent),
+    )
+
+
+class EvidenceOrigin(str, Enum):
+    """Where one batch of admitted graph evidence came from.
+
+    A closed vocabulary rather than free text, and identifiers rather than
+    sentences: an adapter matches on these and chooses its own wording, so the
+    operation is never dictating how a user reads its output — and the names can
+    never drift into naming whichever private helper produced the evidence.
+    """
+
+    CORPUS = "corpus"
+    SEMANTIC = "semantic"
+    POSTGRES = "postgresql"
+    CARGO = "cargo"
+
+
+@dataclass(frozen=True)
+class CorpusDiscovered:
+    """Authoritative discovery finished and named the live Corpus.
+
+    ``sources`` counts every discovered source and ``semantic_sources`` the
+    subset a Semantic provider would be asked about. ``unclassified`` and
+    ``skipped`` name the files discovery saw but could not type, and the ones it
+    deliberately left out: a caller has to be able to say *which* file was
+    dropped, because the usual response to a wrongly-flagged one is to rename or
+    move it. ``complete`` is false when the scan could not enumerate the whole
+    Corpus, which is the fact that decides whether publication needs partial
+    authority.
+    """
+
+    sources: int
+    semantic_sources: int
+    unclassified: tuple[str, ...]
+    skipped: tuple[str, ...]
+    complete: bool
+
+
+@dataclass(frozen=True)
+class SourcesInterpreted:
+    """A Semantic provider answered for the sources it was asked about.
+
+    ``interpreted`` counts only completely interpreted sources, so a difference
+    from ``requested`` is exactly the interpretation this run owes and did not
+    get — the same reading the publication rules apply.
+    """
+
+    requested: int
+    interpreted: int
+
+
+@dataclass(frozen=True)
+class EvidenceCollected:
+    """One evidence source finished and reported what it contributed."""
+
+    origin: EvidenceOrigin
+    nodes: int
+    edges: int
+    hyperedges: int = 0
+
+
+@dataclass(frozen=True)
+class PublicationStarted:
+    """Every requested source completed; the canonical commit begins.
+
+    Deliberately not paired with a completion event: the terminal outcome the
+    operation returns *is* that event, and reporting it twice would let an
+    adapter render two different endings for one operation.
+    """
+
+
+Observation: TypeAlias = (
+    CorpusDiscovered | SourcesInterpreted | EvidenceCollected | PublicationStarted
+)
+
+
+@runtime_checkable
+class ObservationAdapter(Protocol):
+    """Render ordered lifecycle observations for a caller.
+
+    The one seam that receives rather than answers: :class:`SemanticProvider` and
+    the source-system requests exist because the systems behind them are
+    external, while this exists because progress belongs to whoever is watching.
+    An adapter is told coarse facts about an operation in the order they become
+    true; it is never handed private state or a message to print, and it never
+    decides anything. An adapter that raises is warned about and dropped rather
+    than being allowed to fail or cancel the work it was only watching.
+    """
+
+    def observe(self, observation: Observation) -> None:
+        """Receive one lifecycle observation."""
+        ...

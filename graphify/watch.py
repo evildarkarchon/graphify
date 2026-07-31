@@ -1,6 +1,5 @@
 # watch a folder and submit the changes as Code updates
 from __future__ import annotations
-import json
 import os
 import sys
 import time
@@ -14,79 +13,22 @@ if TYPE_CHECKING:  # imported for annotations only; the runtime import is lazy
     from graphify.generation import Corpus, TerminalOutcome
 
 
-# Build options that must survive into later rebuilds. The initial `extract`
-# scan honours `--exclude`, but `update`/`watch`/hook rebuilds re-run detect()
-# and would silently re-include excluded paths unless the patterns are persisted
-# (#1886). We store them beside the graph so any rebuild driver can re-apply them.
-_BUILD_CONFIG_FILENAME = ".graphify_build.json"
+def _watcher_honors_vcs_ignores(watch_path: Path) -> bool:
+    """Return whether the watcher's own event filter should honor VCS ignores.
 
-
-def _write_build_config(
-    out_dir: Path,
-    *,
-    excludes: "list[str] | None",
-    gitignore: bool | None = None,
-    root: Path | None = None,
-) -> None:
-    """Persist corpus-shaping options under ``out_dir``.
-
-    Best effort and non clobbering: omitted options retain their existing values.
-    Publication goes through ``CorpusGraph`` so build policy cannot become a
-    competing piece of canonical generation state.
+    Read from the Corpus build policy the active Graph generation was built
+    under, so the watcher does not keep a second opinion about the shape of the
+    Corpus (#1886/#1971). This only decides which filesystem events are
+    forwarded as optimization hints — the operation rediscovers the Corpus
+    authoritatively either way — so an unreadable policy falls back to the
+    documented default rather than refusing to watch.
     """
-    if not excludes and gitignore is None:
-        return
+    from graphify.generation import CorpusGraph
+
     try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / _BUILD_CONFIG_FILENAME
-        try:
-            config = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-        except (OSError, json.JSONDecodeError):
-            config = {}
-        if not isinstance(config, dict):
-            config = {}
-        if excludes:
-            config["excludes"] = list(excludes)
-        if gitignore is not None:
-            config["gitignore"] = gitignore
-        from graphify.generation import Corpus, CorpusGraph, FullExtractionRequest
-        from graphify.generation._publication import _Publication
-
-        CorpusGraph(
-            Corpus(root=root or out_dir.parent, output=out_dir)
-        ).full_extraction(
-            FullExtractionRequest(),
-            _publication=_Publication(build_config=config),
-        )
-    except OSError:
-        pass
-
-
-def _read_build_excludes(out_dir: Path) -> list[str]:
-    """Return the persisted ``--exclude`` patterns for this graph, or []."""
-    try:
-        path = out_dir / _BUILD_CONFIG_FILENAME
-        if path.is_file():
-            cfg = json.loads(path.read_text(encoding="utf-8"))
-            ex = cfg.get("excludes") if isinstance(cfg, dict) else None
-            if isinstance(ex, list):
-                return [str(x) for x in ex if isinstance(x, str) and x]
-    except (OSError, json.JSONDecodeError):
-        pass
-    return []
-
-
-def _read_build_gitignore(out_dir: Path) -> bool:
-    """Return whether rebuilds should honor VCS ignore files (default True)."""
-    try:
-        path = out_dir / _BUILD_CONFIG_FILENAME
-        if path.is_file():
-            cfg = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(cfg, dict) and isinstance(cfg.get("gitignore"), bool):
-                return cfg["gitignore"]
-    except (OSError, json.JSONDecodeError):
-        pass
-    return True
+        return CorpusGraph(_corpus_for(watch_path)).active_build_policy().gitignore
+    except (OSError, ValueError):
+        return True
 
 
 def _apply_resource_limits() -> None:
@@ -179,27 +121,6 @@ def _corpus_for(watch_path: Path) -> "Corpus":
     from graphify.generation import Corpus
 
     return Corpus(root=watch_path, output=watch_path / _GRAPHIFY_OUT)
-
-
-def _outcome_covers_the_request(outcome: "TerminalOutcome") -> bool:
-    """Return the legacy boolean one Code-update terminal outcome maps to.
-
-    True means a published Graph generation now describes the Corpus the caller
-    asked about — whether this request produced it, only advanced Corpus state,
-    or found the active generation already covering it. Every other outcome left
-    the request uncovered, which is what the callers that still take a boolean
-    have always spelled False.
-    """
-    from graphify.generation import (
-        AlreadyCurrent,
-        CorpusStateAdvanced,
-        GenerationPublished,
-    )
-
-    return isinstance(
-        outcome,
-        (GenerationPublished, CorpusStateAdvanced, AlreadyCurrent),
-    )
 
 
 def _render_code_update(
@@ -339,8 +260,10 @@ def _submit_code_update(
         # malformed request still raises: that is a caller bug, not an outcome.
         print(f"{prefix}Code update could not start: {exc}", file=sys.stderr)
         return False
+    from graphify.generation import covers_the_request
+
     _render_code_update(outcome, prefix=prefix)
-    if not _outcome_covers_the_request(outcome):
+    if not covers_the_request(outcome):
         # Nothing was published, so the active generation is whatever it already
         # was. Its Stale semantic evidence is still true, but printing it under a
         # refusal reads as a finding about this run rather than a standing fact.
@@ -486,7 +409,7 @@ def watch(watch_path: Path, debounce: float = 3.0) -> None:
     watch_root_for_ignore = watch_path.resolve()
     ignore_patterns = _load_graphifyignore(
         watch_root_for_ignore,
-        gitignore=_read_build_gitignore(watch_path / _GRAPHIFY_OUT),
+        gitignore=_watcher_honors_vcs_ignores(watch_path),
     )
 
     class Handler(FileSystemEventHandler):

@@ -241,8 +241,12 @@ def test_explicit_exclude_replaces_persisted_setting_with_custom_out(tmp_path):
     assert any(source.endswith("app.py") for source in sources)
     assert any(source.endswith("vendor/lib.py") for source in sources)
     assert not any(source.endswith("generated/gen.py") for source in sources)
+    # A Corpus policy is recorded whole: the request that replaced the excludes
+    # also states the ignore-file setting it composed with, so a later reader
+    # cannot mistake an unstated half for "never decided".
     assert json.loads((graph_out / ".graphify_build.json").read_text()) == {
-        "excludes": ["generated"]
+        "excludes": ["generated"],
+        "gitignore": True,
     }
 
 

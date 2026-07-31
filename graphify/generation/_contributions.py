@@ -21,7 +21,14 @@ _UNATTRIBUTED_LEGACY_SOURCE = "@legacy/unattributed"
 # distinguishes such a key from a relative path, so it can never collide with a
 # real source, and it is preserved verbatim rather than being relativized
 # against a Corpus root it was never inside.
-_EXTERNAL_SOURCE_SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*://[^\\]+$")
+#
+# One slash or two: the introspectors build these addresses with PurePosixPath,
+# which collapses ``postgresql://host/db`` to ``postgresql:/host/db``, so the
+# collapsed spelling is the one that actually reaches a ledger. The scheme must
+# be at least two characters, which is what keeps a Windows drive letter
+# (``c:/project/app.py``) from being mistaken for a source system and surviving
+# a scan that proved the file is gone.
+_EXTERNAL_SOURCE_SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]+:/{1,2}[^\\]+$")
 
 
 def _is_external_source_identity(source: Any) -> bool:

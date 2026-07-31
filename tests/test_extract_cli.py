@@ -70,7 +70,7 @@ def test_extract_exits_nonzero_when_all_semantic_chunks_fail(
     )
 
     stderr = capsys.readouterr().err
-    assert "all semantic chunks failed" in stderr
+    assert "every semantic chunk failed" in stderr
     assert "claude" in stderr
 
     # No graph.json should have been written - the failure must abort before
@@ -215,9 +215,12 @@ def test_incremental_partial_run_preserves_untouched_semantic_hash(
 def test_truncated_doc_semantic_hash_is_cleared_for_requeue(monkeypatch, tmp_path):
     """#1948 x #1950 interaction: a doc stamped complete on a prior run that
     TRUNCATES (partial) this run must have its stale semantic_hash cleared, so
-    detect_incremental re-queues it — not inherit the old hash and look
-    unchanged. Partial files are dropped by _stamped_manifest_files, so they
-    land in clear_semantic (dispatched-but-not-stamped)."""
+    the next run re-interprets it rather than inheriting the old hash and
+    looking unchanged.
+
+    A truncated source is now an incomplete interpretation, so publishing the
+    run at all takes explicit partial authority; the first attempt without it is
+    refused, which is the same guarantee stated more strongly."""
     import json
 
     corpus = _make_corpus(tmp_path)  # main.go + README.md
@@ -239,23 +242,29 @@ def test_truncated_doc_semantic_hash_is_cleared_for_requeue(monkeypatch, tmp_pat
     monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _extract)
     monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
 
-    def _run():
+    def _run(*extra: str, expect: int = 0):
         monkeypatch.setattr(mainmod.sys, "argv",
                             ["graphify", "extract", str(corpus), "--backend", "claude",
-                             "--no-cluster", "--out", str(out_dir)])
+                             "--no-cluster", "--out", str(out_dir), *extra])
         try:
             mainmod.main()
         except SystemExit as exc:
-            assert exc.code in (None, 0)
+            assert (exc.code or 0) == expect, f"unexpected exit code {exc.code}"
 
     manifest_path = out_dir / "graphify-out" / "manifest.json"
     _run()  # run 1: complete
     assert json.loads(manifest_path.read_text())["README.md"].get("semantic_hash")
 
-    # run 2: README.md changes and truncates (partial) this time.
+    # run 2: README.md changes and truncates (partial) this time. Without the
+    # authority to publish an unfinished run, nothing is replaced at all.
     (corpus / "README.md").write_text("# Notes\nNew, longer content that truncated.\n")
     partial_run["on"] = True
-    _run()
+    _run(expect=1)
+    assert json.loads(manifest_path.read_text())["README.md"].get("semantic_hash")
+
+    # Authorized, the run publishes what completed — and the truncated doc's
+    # stale stamp is cleared so the next run re-interprets it.
+    _run("--allow-partial")
     m2 = json.loads(manifest_path.read_text())
     assert not m2.get("README.md", {}).get("semantic_hash"), (
         "a truncated doc's stale semantic_hash must be cleared so it is "
@@ -670,7 +679,11 @@ def test_missing_manifest_code_only_preserves_semantic_layer(monkeypatch, tmp_pa
     # 3) manifest goes missing (fresh clone / deliberately untracked)
     (graphify_out / "manifest.json").unlink()
     # Direct compatibility mutation explicitly returns the fixture to legacy
-    # markerless state before the owner adopts it on the next operation.
+    # pre-ledger state before the owner adopts it on the next operation. The
+    # ledger goes with the marker on purpose: while a ledger is present it is
+    # the authority, and a graph edited behind its back is republished from it
+    # rather than adopted.
+    (graphify_out / ".graphify_contributions.jsonl").unlink(missing_ok=True)
     (graphify_out / ".graphify_generation_complete").unlink(missing_ok=True)
 
     # 4) re-run the SAME code-only extract
@@ -763,6 +776,57 @@ def test_extract_without_key_still_errors_when_docs_present(
     assert not (out_dir / "graphify-out" / "graph.json").exists()
 
 
+def test_extract_renders_the_operations_own_lifecycle_facts(
+    monkeypatch, tmp_path, capsys
+):
+    """Report progress from the observations, not from the CLI's own bookkeeping.
+
+    Every line here corresponds to one lifecycle fact the operation reported —
+    discovery, each evidence source finishing, the commit, and the terminal
+    outcome — which is what lets the CLI stay a presentation adapter over work it
+    no longer sequences itself.
+    """
+    corpus = _make_corpus(tmp_path)  # main.go + README.md
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
+
+    def _interpret(paths, **kwargs):
+        on_chunk = kwargs.get("on_chunk_done")
+        result = {
+            "nodes": [{"id": "readme", "source_file": "README.md",
+                       "file_type": "document"}],
+            "edges": [], "hyperedges": [],
+            "input_tokens": 7, "output_tokens": 3,
+            "failed_chunks": 0, "uncovered_files": [],
+        }
+        if on_chunk:
+            on_chunk(0, 1, result)
+        return result
+
+    monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _interpret)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys, "argv",
+        ["graphify", "extract", str(corpus), "--backend", "claude",
+         "--no-cluster", "--out", str(out_dir)],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        mainmod.main()
+    assert exc.value.code == 0
+
+    out = capsys.readouterr().out
+    assert "found 2 source(s), 1 of them semantic" in out
+    assert "interpreted 1 of 1 semantic source(s)" in out
+    assert "semantic provider: 1 nodes" in out
+    assert "corpus filesystem:" in out
+    assert "publishing the Graph generation" in out
+    assert "Graph generation published" in out
+    # The provider reported what interpretation cost, so the CLI does not have
+    # to infer it from anything it holds itself.
+    assert "tokens: 7 in / 3 out" in out
+
+
 def test_extract_timing_flag_emits_stage_timings(monkeypatch, tmp_path, capsys):
     """--timing prints per-stage `[graphify timing]` lines to stderr (#1490); omitting
     it prints none, so default output is unchanged. Code-only corpus => no API key."""
@@ -798,9 +862,18 @@ def test_extract_timing_flag_emits_stage_timings(monkeypatch, tmp_path, capsys):
     [["--postgres", "test-dsn"], ["--postgres=test-dsn"]],
 )
 @pytest.mark.parametrize("cluster_args", [[], ["--no-cluster"]])
-def test_pathless_postgres_extract_initializes_empty_detection(
+def test_pathless_postgres_extract_publishes_the_schema_it_was_given(
     monkeypatch, tmp_path, postgres_args, cluster_args
 ):
+    """A path-less `extract --postgres DSN` still runs, and its evidence stands.
+
+    Every operation performs authoritative Corpus discovery, so a path-less run
+    is simply one whose Corpus root is the working directory — here an empty
+    launcher, which is why nothing from the other Corpus is carried into it. The
+    schema evidence it collects is keyed to the system address that produced it,
+    so a later filesystem run neither confirms nor denies it and leaves it
+    alone: only asking PostgreSQL again can replace it.
+    """
     calls = []
 
     def _introspect(dsn):
@@ -850,15 +923,9 @@ def test_pathless_postgres_extract_initializes_empty_detection(
     )
     assert manifest.exists()
     assert "app.py" in _node_sources(graph_path)
-    manifest_content = manifest.read_text()
-    (out_root / "graphify-out" / ".graphify_semantic_marker").write_text(
-        '{"output_tokens": 1}'
-    )
-    # This test deliberately mutates a canonical sidecar outside CorpusGraph.
-    (out_root / "graphify-out" / ".graphify_generation_complete").unlink(
-        missing_ok=True
-    )
 
+    # A cache entry belonging to the other Corpus: a run that interprets nothing
+    # must not sweep it.
     cache_entry = (
         out_root
         / "graphify-out"
@@ -880,15 +947,11 @@ def test_pathless_postgres_extract_initializes_empty_detection(
     )
     assert calls == ["test-dsn"]
     assert cache_entry.exists()
-    assert not manifest.exists()
-    assert "postgresql:/localhost/test" in _node_sources(graph_path)
-    backups = [
-        path
-        for path in (out_root / "graphify-out").iterdir()
-        if path.is_dir() and (path / "manifest.json").exists()
-    ]
-    assert backups
-    assert backups[0].joinpath("manifest.json").read_text() == manifest_content
+    pathless_sources = _node_sources(graph_path)
+    assert "postgresql:/localhost/test" in pathless_sources
+    # The launcher directory is the Corpus this run reconciled, and it does not
+    # contain the other project's file.
+    assert "app.py" not in pathless_sources
 
     _run(
         [
@@ -903,7 +966,9 @@ def test_pathless_postgres_extract_initializes_empty_detection(
     )
     final_sources = _node_sources(graph_path)
     assert "app.py" in final_sources
-    assert "postgresql:/localhost/test" not in final_sources
+    # A filesystem scan is not evidence about a database, so the schema's
+    # contribution survives until PostgreSQL is asked again.
+    assert "postgresql:/localhost/test" in final_sources
     assert manifest.exists()
 
 

@@ -14,6 +14,15 @@ import time
 from graphify.generation._manifest import _stamped_manifest_files
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # imported for annotations only; the runtime imports are lazy
+    from graphify.generation import (
+        CorpusDiscovered,
+        CorpusGraph,
+        Observation,
+        TerminalOutcome,
+    )
 
 
 _SEARCH_NUDGE = json.dumps({
@@ -118,262 +127,6 @@ def _disclose_stale_semantic_evidence(graph_path: Path) -> None:
         print(f"[!] STALE SEMANTIC EVIDENCE: {disclosure}\n")
 
 
-def _stale_graph_sources(
-    graph_path: Path,
-    scan_root: Path,
-    seen_files: set[str],
-    detection: dict | None = None,
-) -> list[str]:
-    """Source files graph.json still references but the current scan no longer
-    contains (#1909).
-
-    Incremental extract's prune set was historically derived from the manifest
-    alone (``manifest - corpus``), so a file that became EXCLUDED
-    (.graphifyignore/.gitignore/--exclude changed) without being listed in the
-    manifest kept its stale nodes in graph.json forever. Derive prune
-    candidates from the graph's own node ``source_file``s instead: anything
-    the graph references that the post-exclude detect corpus no longer
-    contains is stale, whether the file was deleted or newly excluded.
-
-    Only IN-ROOT paths are candidates: out-of-root/absolute entries
-    (--include sources, symlinked external corpora) are never walked by
-    detect, so their absence from the corpus is not staleness evidence.
-    Relative entries are re-anchored against both the scan root and the
-    graph's own output root; only anchors that land inside the scan root
-    count. Since #1941 extracts always store source_file relative to the SCAN
-    root, so the scan-root anchor is the live one; the out-root anchor stays
-    for graphs written by <=0.9.16, which stored them relative to the OUT root
-    (e.g. ``../project/x.py``, #555/#1899).
-    ``seen_files`` must be the FULL detect output including unclassified
-    files, so nodes from walked-but-unsupported sources (e.g. introspected
-    Cargo.toml manifests) are not misread as stale.
-
-    Paths are compared NFC-normalized on both sides: macOS reports NFD
-    filenames while graph ``source_file`` entries are typically NFC, and a
-    raw-string membership test misread every accented live file as stale
-    (#2210; same class as the manifest-layer #2221/#2224).
-
-    Fail-closed liveness guard (#2210, mirrors watch.py's excluded-vs-deleted
-    distinction): a source missing from the scan corpus is only pruned when
-    the file is gone from disk, or when its exclusion is PROVABLE from the
-    same scan that produced ``seen_files`` — ``detection``'s ``ignored`` /
-    ``pruned_noise_dirs`` / ``skipped_sensitive`` output, or detect's
-    sensitivity predicate. An alive file that merely failed the membership
-    test (path-spelling drift the normalization didn't cover, walk errors,
-    …) is KEPT and reported, never mass-evicted.
-    """
-    from graphify.paths import nfc
-    try:
-        data = json.loads(graph_path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    if not isinstance(data, dict):
-        return []
-    try:
-        root_res = scan_root.resolve()
-    except (OSError, RuntimeError):
-        root_res = scan_root
-    # <out>/graphify-out/graph.json — relative source_files may be anchored here.
-    out_base = graph_path.parent.parent
-    try:
-        out_base = out_base.resolve()
-    except (OSError, RuntimeError):
-        pass
-
-    def _within_root(p: Path) -> bool:
-        try:
-            p.relative_to(root_res)
-            return True
-        except ValueError:
-            pass
-        try:
-            p.resolve().relative_to(root_res)
-            return True
-        except (ValueError, OSError, RuntimeError):
-            return False
-
-    seen_nfc = {nfc(s) for s in seen_files}
-    seen_basenames = {nfc(os.path.basename(s)) for s in seen_files}
-
-    def _in_seen(p: Path) -> bool:
-        if nfc(str(p)) in seen_nfc:
-            return True
-        try:
-            return nfc(str(p.resolve())) in seen_nfc
-        except (OSError, RuntimeError):
-            return False
-
-    # Provable-exclusion evidence from the scan that produced seen_files:
-    # individually ignored files are exact entries; ignored/noise-pruned
-    # directories are recorded once with a trailing separator and cover
-    # their whole subtree. skipped_sensitive entries may carry a
-    # " [reason]" suffix.
-    excluded_exact: set[str] = set()
-    excluded_prefixes: list[str] = []
-    if detection:
-        for entry in list(detection.get("ignored", [])) + list(
-            detection.get("pruned_noise_dirs", [])
-        ):
-            e = nfc(str(entry))
-            if e.endswith(os.sep) or e.endswith("/"):
-                excluded_prefixes.append(e)
-            else:
-                excluded_exact.add(e)
-        for entry in detection.get("skipped_sensitive", []):
-            excluded_exact.add(nfc(str(entry).split(" [", 1)[0]))
-
-    def _provably_excluded(c: Path) -> bool:
-        spellings = [nfc(str(c))]
-        try:
-            spellings.append(nfc(str(c.resolve())))
-        except (OSError, RuntimeError):
-            pass
-        for s in spellings:
-            if s in excluded_exact:
-                return True
-            if any(s.startswith(pref) for pref in excluded_prefixes):
-                return True
-        try:
-            from graphify.detect import _is_sensitive as _det_sensitive
-            if _det_sensitive(c):
-                return True
-        except Exception:
-            pass
-        return False
-
-    stale: list[str] = []
-    kept_alive: list[str] = []
-    checked: set[str] = set()
-    for n in data.get("nodes", []):
-        if not isinstance(n, dict):
-            continue
-        sf = n.get("source_file")
-        if not sf or not isinstance(sf, str) or sf in checked:
-            continue
-        checked.add(sf)
-        if "://" in sf:
-            continue  # remote/virtual source (e.g. Google Workspace), not a scanned path
-        p = Path(sf)
-        if p.is_absolute():
-            candidates = [p]
-        else:
-            rel = sf.replace("\\", "/")
-            bases = [root_res]
-            if out_base != root_res:
-                bases.append(out_base)
-            candidates = [
-                Path(os.path.normpath(str(base / rel))) for base in bases
-            ]
-        in_root = [c for c in candidates if _within_root(c)]
-        if not in_root:
-            continue  # out-of-root under every anchor: never prune
-        if any(_in_seen(c) for c in in_root):
-            continue  # still part of the scan corpus
-        # Fail-closed liveness guard (#2210): absence from the corpus is
-        # only deletion evidence when the file is actually gone from disk.
-        alive = []
-        for c in in_root:
-            try:
-                if c.exists():
-                    alive.append(c)
-            except OSError:
-                pass
-        if alive:
-            if all(_provably_excluded(c) for c in alive):
-                stale.append(sf)  # alive but excluded under current rules (#1909)
-            else:
-                kept_alive.append(sf)
-            continue
-        # No anchored candidate exists, but a legacy bare-basename spelling
-        # can't be anchored reliably — a live corpus file with the same name
-        # means deletion is unproven; keep.
-        rel_sf = sf.replace("\\", "/")
-        if "/" not in rel_sf and nfc(rel_sf) in seen_basenames:
-            kept_alive.append(sf)
-            continue
-        stale.append(sf)
-    if kept_alive:
-        print(
-            f"[graphify] fail-closed: kept node(s) from {len(kept_alive)} "
-            "source file(s) that left the scan corpus but still exist on disk "
-            "(ignore rules or filters changed?). Run a full re-extraction to "
-            "purge them if the exclusion is intentional.",
-            file=sys.stderr,
-        )
-    return stale
-
-
-def _prune_graph_json_sources(graph_path: Path, stale_sources: list[str]) -> int:
-    """Drop nodes/edges/hyperedges owned by ``stale_sources`` from graph.json
-    in place. Returns the number of nodes removed.
-
-    Used by the ``--no-cluster`` incremental early-exit: that path never runs
-    ``build_merge`` (it would raw-dump only the new chunks), so an
-    exclusion-only change must prune the existing raw graph directly or the
-    newly-excluded file's nodes survive forever (#1909).
-    ``stale_sources`` comes from :func:`_stale_graph_sources`, i.e. the
-    graph's own ``source_file`` spellings, so exact string matching is enough.
-
-    Raises ``RuntimeError`` if the canonical owner cannot publish the pruned
-    graph; callers must not report a successful prune while the old graph
-    remains active.
-    """
-    try:
-        data = json.loads(graph_path.read_text(encoding="utf-8"))
-    except Exception:
-        return 0
-    if not isinstance(data, dict):
-        return 0
-    stale = set(stale_sources)
-    links_key = "links" if "links" in data else "edges"
-    nodes = [n for n in data.get("nodes", []) if isinstance(n, dict)]
-    kept_nodes = [n for n in nodes if n.get("source_file") not in stale]
-    removed_ids = {
-        n.get("id") for n in nodes if n.get("source_file") in stale
-    }
-    n_removed = len(nodes) - len(kept_nodes)
-    kept_edges = [
-        e for e in data.get(links_key, [])
-        if isinstance(e, dict)
-        and e.get("source_file") not in stale
-        and e.get("source") not in removed_ids
-        and e.get("target") not in removed_ids
-    ]
-    kept_hyper = [
-        h for h in data.get("hyperedges", [])
-        if isinstance(h, dict) and h.get("source_file") not in stale
-    ]
-    if n_removed == 0 and len(kept_edges) == len(data.get(links_key, [])) and (
-        len(kept_hyper) == len(data.get("hyperedges", []))
-    ):
-        return 0
-    data["nodes"] = kept_nodes
-    data[links_key] = kept_edges
-    if "hyperedges" in data:
-        data["hyperedges"] = kept_hyper
-    from graphify.generation import (
-        CodeUpdateRequest,
-        Corpus,
-        CorpusGraph,
-        GenerationPublished,
-    )
-    from graphify.generation._publication import _GraphData, _Publication
-
-    outcome = CorpusGraph(
-        Corpus(root=graph_path.parent.parent, output=graph_path.parent)
-    ).code_update(
-        CodeUpdateRequest(tuple(Path(source) for source in stale_sources)),
-        _publication=_Publication(
-            graph=_GraphData(data, force=True),
-            protect_previous=True,
-        ),
-    )
-    if not isinstance(outcome, GenerationPublished):
-        reason = getattr(outcome, "reason", type(outcome).__name__)
-        raise RuntimeError(f"could not publish pruned graph: {reason}")
-    return n_removed
-
-
 class _StageTimer:
     """Print per-stage wall-clock timings to stderr when --timing is set (#1490).
 
@@ -398,6 +151,279 @@ class _StageTimer:
     def total(self) -> None:
         if self.enabled:
             print(f"[graphify timing] total: {self._now() - self.start:.1f}s", file=sys.stderr)
+
+
+# --- Full-extraction adapters ----------------------------------------------
+#
+# `graphify extract` is a translation and presentation adapter over the Full
+# extraction operation. It parses flags into one ``FullExtractionRequest``,
+# renders the ordered observations and the terminal outcome the operation
+# reports, and chooses an exit code. Discovery, extraction, interpretation,
+# reconciliation, safety checks, and every canonical write live in
+# ``graphify.generation``, which is the sole canonical writer for a Corpus.
+
+_EXTRACT_PREFIX = "[graphify extract] "
+
+# How many file names one discovery line shows before it counts the rest.
+_NAMED_FILES = 6
+
+# How this command names each evidence origin. The operation reports a closed
+# identifier and leaves the wording to whoever is rendering it, which is why the
+# phrasing lives here rather than in the observation.
+_ORIGIN_WORDING = {
+    "corpus": "corpus filesystem",
+    "semantic": "semantic provider",
+    "postgresql": "PostgreSQL",
+    "cargo": "Cargo workspace",
+}
+
+
+def _named_files(entries: "list[str] | tuple[str, ...]") -> str:
+    """Return the file names behind a discovery line, capped so it stays one line."""
+    names = sorted({Path(entry).name for entry in entries})
+    more = f" (+{len(names) - _NAMED_FILES} more)" if len(names) > _NAMED_FILES else ""
+    return ", ".join(names[:_NAMED_FILES]) + more
+
+
+class _ExtractionProgress:
+    """Render one Full extraction's lifecycle observations for a terminal.
+
+    A closed match over the observation union, exactly like the terminal-outcome
+    rendering beside it: the operation reports facts, and this decides how a CLI
+    user should read them. ``stages`` is marked from the same facts so ``--timing``
+    measures the operation's real phases rather than the adapter's guesses about
+    them, and ``code_only`` is what turns "documents were discovered" from a
+    count into the note that they are being skipped on purpose.
+    """
+
+    def __init__(self, stages: "_StageTimer", *, code_only: bool = False) -> None:
+        """Bind rendering to one run's stage timer and requested evidence."""
+        self._stages = stages
+        self._code_only = code_only
+
+    def observe(self, observation: "Observation") -> None:
+        """Print one lifecycle observation in the extraction CLI's voice."""
+        from graphify.generation import (
+            CorpusDiscovered,
+            EvidenceCollected,
+            PublicationStarted,
+            SourcesInterpreted,
+        )
+
+        if isinstance(observation, CorpusDiscovered):
+            self._discovered(observation)
+            self._stages.mark("detect")
+        elif isinstance(observation, SourcesInterpreted):
+            print(
+                f"{_EXTRACT_PREFIX}interpreted {observation.interpreted} of "
+                f"{observation.requested} semantic source(s)"
+            )
+        elif isinstance(observation, EvidenceCollected):
+            origin = _ORIGIN_WORDING.get(observation.origin.value, observation.origin.value)
+            print(
+                f"{_EXTRACT_PREFIX}{origin}: {observation.nodes} "
+                f"nodes, {observation.edges} edges"
+                + (
+                    f", {observation.hyperedges} hyperedges"
+                    if observation.hyperedges
+                    else ""
+                )
+            )
+            self._stages.mark(origin)
+        elif isinstance(observation, PublicationStarted):
+            print(f"{_EXTRACT_PREFIX}publishing the Graph generation...")
+
+    def _discovered(self, observation: "CorpusDiscovered") -> None:
+        """Report what authoritative discovery found in the Corpus."""
+        print(
+            f"{_EXTRACT_PREFIX}found {observation.sources} source(s), "
+            f"{observation.semantic_sources} of them semantic"
+        )
+        if self._code_only and observation.semantic_sources:
+            print(
+                f"{_EXTRACT_PREFIX}--code-only: skipping LLM extraction for "
+                f"{observation.semantic_sources} doc/paper/image source(s); they "
+                "are represented by whatever structure can be derived locally"
+            )
+        if observation.unclassified:
+            print(
+                f"{_EXTRACT_PREFIX}{len(observation.unclassified)} file(s) not "
+                "classified (no supported extension or shebang), skipped: "
+                f"{_named_files(observation.unclassified)}"
+            )
+        # Operational skips (symlink/office/Workspace) carry a " [reason]"
+        # suffix; this line reports only the security-heuristic drops, because
+        # those are the ones a user may want to un-flag by renaming (#2106).
+        flagged = [entry for entry in observation.skipped if " [" not in entry]
+        if flagged:
+            print(
+                f"{_EXTRACT_PREFIX}{len(flagged)} file(s) skipped as potentially "
+                f"sensitive (rename or move if wrongly flagged): "
+                f"{_named_files(flagged)}"
+            )
+        if not observation.complete:
+            print(
+                f"{_EXTRACT_PREFIX}warning: discovery could not enumerate the "
+                "whole Corpus; publication needs --allow-partial",
+                file=sys.stderr,
+            )
+
+
+def _render_full_extraction(outcome: "TerminalOutcome") -> bool:
+    """Print one Full extraction terminal outcome and say whether it published.
+
+    Returns whether the Corpus is now current with the request, which is what
+    the caller turns into an exit code. The wording is this adapter's own — the
+    operation publishes facts and each adapter decides how its users read them —
+    but the verdict is not: it comes from the owning module, so a CLI exit code
+    and the queue's own accounting of covered work cannot disagree. Refusals and
+    failures go to stderr so a scripted run keeps the stream contract `graphify
+    extract` always had.
+    """
+    from graphify.generation import (
+        AlreadyCurrent,
+        Cancelled,
+        CorpusStateAdvanced,
+        GenerationPublished,
+        OperationFailed,
+        PublicationRefused,
+        Queued,
+        covers_the_request,
+    )
+
+    if isinstance(outcome, GenerationPublished):
+        print(
+            f"{_EXTRACT_PREFIX}Graph generation published. Canonical artifacts "
+            f"changed: {', '.join(outcome.changed_artifacts) or 'none'}."
+        )
+    elif isinstance(outcome, CorpusStateAdvanced):
+        print(
+            f"{_EXTRACT_PREFIX}Corpus state advanced; the graph itself is unchanged."
+        )
+    elif isinstance(outcome, AlreadyCurrent):
+        print(f"{_EXTRACT_PREFIX}The active Graph generation already covers this run.")
+    elif isinstance(outcome, PublicationRefused):
+        print(f"{_EXTRACT_PREFIX}error: publication refused: {outcome.reason}", file=sys.stderr)
+    elif isinstance(outcome, OperationFailed):
+        print(f"{_EXTRACT_PREFIX}error: {outcome.reason}", file=sys.stderr)
+    elif isinstance(outcome, Cancelled):
+        print(
+            f"{_EXTRACT_PREFIX}Cancelled before commit; the active Graph "
+            "generation is unchanged.",
+            file=sys.stderr,
+        )
+    elif isinstance(outcome, Queued):  # pragma: no cover — extraction refuses this
+        print(f"{_EXTRACT_PREFIX}Queued as {outcome.request_id}.")
+    return covers_the_request(outcome)
+
+
+def _published_graph_size(graph_path: Path) -> tuple[int, int]:
+    """Return the node and edge counts of the published graph, or zeros.
+
+    Read back from the stable public artifact rather than from anything the
+    operation kept to itself: what the CLI reports is what a user (and every
+    other tool) can see on disk.
+    """
+    try:
+        data = json.loads(graph_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0, 0
+    links = data.get("links")
+    if links is None:
+        links = data.get("edges") or []
+    return len(data.get("nodes") or []), len(links)
+
+
+def _publish_clustered_generation(
+    owner: "CorpusGraph",
+    graph_path: Path,
+    *,
+    resolution: float,
+    exclude_hubs: "float | None",
+    stages: "_StageTimer",
+) -> bool:
+    """Complete a published Raw generation with community identity and analysis.
+
+    Full extraction publishes a Raw graph generation, because clustering is
+    Reclustering's work rather than extraction's. Until that operation moves
+    behind ``CorpusGraph`` (issue #13) this prepares the clustered candidate and
+    hands it to the owner's documented compatibility handoff, so `graphify
+    extract` keeps producing the communities and analysis it always has and the
+    owning module remains the only canonical writer.
+
+    Reads the Corpus's own published graph, so the clustered generation is
+    derived from exactly the evidence the Raw one admitted rather than from a
+    second in-memory build that could differ from it. Returns whether the
+    clustered generation was published.
+    """
+    from graphify.analyze import god_nodes, surprising_connections
+    from graphify.build import build_from_json
+    from graphify.cluster import cluster, score_all
+    from graphify.generation import ReclusteringRequest, covers_the_request
+    from graphify.generation._publication import _GraphModel, _Publication
+
+    try:
+        raw = json.loads(graph_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(
+            f"{_EXTRACT_PREFIX}error: cannot read the published graph: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    graph = build_from_json(raw, directed=bool(raw.get("directed", False)))
+    if graph.number_of_nodes() == 0:
+        print(
+            f"{_EXTRACT_PREFIX}error: the published graph is empty — extraction "
+            "produced no nodes. Possible causes: all files skipped, a binary-only "
+            "corpus, or an LLM that returned no edges.",
+            file=sys.stderr,
+        )
+        return False
+    communities = cluster(graph, resolution=resolution, exclude_hubs_percentile=exclude_hubs)
+    stages.mark("cluster")
+    cohesion = score_all(graph, communities)
+    # Analysis describes the graph rather than being part of its evidence, so
+    # neither of these may cost the caller the generation it just paid for: a
+    # failed measure is reported as absent and the clustered generation stands.
+    try:
+        gods = god_nodes(graph)
+    except Exception:
+        gods = []
+    try:
+        surprises = surprising_connections(graph, communities)
+    except Exception:
+        surprises = []
+    stages.mark("analyze")
+    outcome = owner.reclustering(
+        ReclusteringRequest(),
+        _publication=_Publication(
+            graph=_GraphModel(graph, communities, force=True),
+            analysis={
+                "communities": {str(cid): members for cid, members in communities.items()},
+                "cohesion": {str(cid): score for cid, score in cohesion.items()},
+                "gods": gods,
+                "surprises": surprises,
+            },
+            protect_previous=True,
+        ),
+    )
+    if not covers_the_request(outcome):
+        # Every non-covering outcome is a failure for this step, including the
+        # ones that carry no reason to quote: the caller asked for a clustered
+        # generation and did not get one.
+        print(
+            f"{_EXTRACT_PREFIX}error: clustering could not be published: "
+            f"{getattr(outcome, 'reason', type(outcome).__name__)}",
+            file=sys.stderr,
+        )
+        return False
+    print(
+        f"{_EXTRACT_PREFIX}wrote {graph_path}: {graph.number_of_nodes()} nodes, "
+        f"{graph.number_of_edges()} edges, {len(communities)} communities"
+    )
+    return True
+
+
 def _enforce_graph_size_cap_or_exit(gp: Path) -> None:
     """Reject oversized graph files before parsing (CLI exit-on-fail flavor).
 
@@ -2633,12 +2659,12 @@ def dispatch_command(cmd: str) -> None:
             print("Usage: graphify global [add|remove|list|path]", file=sys.stderr); sys.exit(1)
 
     elif cmd == "extract":
-        # Headless full-pipeline extraction for CI / scripts (#698).
-        # Runs detect -> AST extraction on code -> semantic LLM extraction on
-        # docs/papers/images -> merge -> build -> cluster -> write outputs.
-        # Unlike the skill.md path (which runs through Claude Code subagents),
-        # this calls extract_corpus_parallel directly using whichever backend
-        # has an API key set.
+        # Full extraction: the interpreting half of the Graph-generation
+        # lifecycle, and the only operation that costs LLM tokens. Everything in
+        # this branch translates flags into one ``FullExtractionRequest``,
+        # renders what the operation reports, and picks an exit code. Discovery,
+        # AST extraction, interpretation, reconciliation, the safety rules, and
+        # every canonical write belong to ``graphify.generation``.
         if len(sys.argv) < 3:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
@@ -2685,7 +2711,10 @@ def dispatch_command(cmd: str) -> None:
         cli_excludes: list[str] = []
         cli_timing: bool = False
         # --force parity with `graphify update`: the flag or GRAPHIFY_FORCE=1
-        # disables the incremental gate and skips semantic-cache reads (#1894).
+        # re-interprets every semantic source instead of serving the provider's
+        # cache, and authorizes replacing the active graph with a smaller one
+        # (#1894). It never weakens a fail-closed publication rule; that is
+        # --allow-partial's separate authority.
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
 
         def _parse_int(name: str, raw: str) -> int:
@@ -2807,6 +2836,29 @@ def dispatch_command(cmd: str) -> None:
         if deep_mode:
             print("[graphify extract] deep mode enabled: richer semantic extraction")
 
+        # Argument validation, so a typo is refused before the request is made
+        # rather than surfacing as a failed evidence source much later.
+        if backend is not None:
+            from graphify.llm import BACKENDS as _BACKENDS
+
+            if backend not in _BACKENDS:
+                print(
+                    f"error: unknown backend '{backend}'. "
+                    f"Available: {', '.join(sorted(_BACKENDS))}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        if dedup_llm:
+            # Accepted so an existing invocation still runs, but it no longer
+            # has anything to act on: a Graph generation's evidence is the
+            # per-source contributions it was reconciled from, and fuzzy entity
+            # merging across sources is not part of that authority.
+            print(
+                "[graphify extract] note: --dedup-llm no longer applies — a Graph "
+                "generation is materialized from its Source contributions.",
+                file=sys.stderr,
+            )
+
         # CLI flag wins over env var. Setting GRAPHIFY_API_TIMEOUT here so
         # _call_openai_compat picks it up without needing a new kwarg path.
         if cli_api_timeout is not None:
@@ -2820,948 +2872,129 @@ def dispatch_command(cmd: str) -> None:
         out_root = (out_dir.resolve() if out_dir else target)
         graphify_out = out_root / _GRAPHIFY_OUT
         graphify_out.mkdir(parents=True, exist_ok=True)
-        # Persist corpus-shaping options so later update/watch/hook rebuilds
-        # use the same file set as the initial extraction (#1886).
-        from graphify.watch import (
-            _write_build_config as _write_build_cfg,
-            _read_build_excludes as _read_build_ex,
-            _read_build_gitignore as _read_build_gi,
-        )
-        # #1971 persistence: an explicit --no-gitignore persists False; a later
-        # flag-less `graphify extract` must NOT clobber it back to True, which
-        # would make the git-ignored code silently disappear again (the exact
-        # complaint #1971 is about). Honor the persisted value for THIS run when
-        # the flag is absent (read before the write below), and write False only
-        # when the flag is set — None leaves the setting as-is, mirroring how
-        # #1886 persists --exclude.
-        _effective_gitignore = False if no_gitignore else _read_build_gi(graphify_out)
-        # An explicit list replaces the persisted one; omission reuses it.
-        _effective_excludes = cli_excludes or _read_build_ex(graphify_out)
-        _write_build_cfg(
-            graphify_out,
-            excludes=cli_excludes or None,
-            gitignore=False if no_gitignore else None,
-            root=target,
-        )
 
         stages = _StageTimer(cli_timing)
 
-        from graphify.detect import (
-            detect as _detect,
-            detect_incremental as _detect_incremental,
+        from graphify.generation import (
+            BuildPolicy as _BuildPolicy,
+            CargoSource as _CargoSource,
+            Corpus as _Corpus,
+            CorpusGraph as _CorpusGraph,
+            FullExtractionRequest as _FullExtractionRequest,
+            GoogleWorkspaceSource as _GoogleWorkspaceSource,
+            PostgresSource as _PostgresSource,
+            ReplaceBuildPolicy as _ReplaceBuildPolicy,
+            SemanticSource as _SemanticSource,
+            WaitUntilCovered as _WaitUntilCovered,
         )
-        manifest_path = graphify_out / "manifest.json"
-        existing_graph_path = graphify_out / "graph.json"
-        # #1925: a missing manifest.json must not degrade to a full scan that
-        # discards the existing graph's semantic layer. An existing graph.json
-        # is a sufficient incremental baseline: detect_incremental treats an
-        # absent manifest as "everything is new" (re-extract all, nothing
-        # deleted), and build_merge + _stale_graph_sources reconcile replaced
-        # and genuinely-deleted sources against the current corpus, so doc/
-        # paper/image nodes survive a --code-only rebuild instead of being
-        # dropped with the rest of the committed graph.
-        incremental_mode = existing_graph_path.exists() if has_path else False
-        # --force: full scan, not the manifest-gated incremental diff — a warm
-        # unchanged tree would otherwise dispatch zero files (#1894).
-        incremental_mode = incremental_mode and not force
-        if force:
-            print("[graphify extract] --force: full re-scan, semantic cache reads skipped")
-        elif incremental_mode and not manifest_path.exists():
-            print(
-                "[graphify extract] manifest.json missing; using existing "
-                "graph.json as the incremental baseline (all files re-checked; "
-                "nodes for files outside this run's scope are preserved)"
-            )
 
-        if not has_path:
-            detection = {}
-            code_files = []
-            doc_files = []
-            paper_files = []
-            image_files = []
-            deleted_files = []
-            excluded_files = []
-            graph_stale_sources = []
-            unchanged_total = 0
-            files_by_type = {}
-        elif incremental_mode:
-            print(f"[graphify extract] incremental scan of {target}")
-            detection = _detect_incremental(
-                target,
-                manifest_path=str(manifest_path),
-                google_workspace=google_workspace or None,
-                extra_excludes=_effective_excludes or None,
-                gitignore=_effective_gitignore,
-            )
-            files_by_type = detection.get("files", {})
-            new_by_type = detection.get("new_files", {})
-            code_files = [Path(p) for p in new_by_type.get("code", [])]
-            doc_files = [Path(p) for p in new_by_type.get("document", [])]
-            paper_files = [Path(p) for p in new_by_type.get("paper", [])]
-            image_files = [Path(p) for p in new_by_type.get("image", [])]
-            deleted_files = list(detection.get("deleted_files", []))
-            excluded_files = list(detection.get("excluded_files", []))
-            unchanged_total = sum(len(v) for v in detection.get("unchanged_files", {}).values())
-            # #1909: derive the prune set from the existing graph itself, not
-            # just the manifest. A file that became excluded without ever
-            # being manifest-listed (every pre-#1897 graph is in this state)
-            # still has stale nodes carried forward by build_merge unless the
-            # graph's own sources are reconciled against the current corpus.
-            _seen_files = {f for _fl in files_by_type.values() for f in _fl}
-            _seen_files.update(detection.get("unclassified", []))
-            graph_stale_sources = _stale_graph_sources(
-                existing_graph_path, target, _seen_files, detection=detection
-            )
-        else:
-            print(f"[graphify extract] scanning {target}")
-            detection = _detect(
-                target,
-                google_workspace=google_workspace or None,
-                extra_excludes=_effective_excludes or None,
-                cache_root=out_root,
-                gitignore=_effective_gitignore,
-            )
-            files_by_type = detection.get("files", {})
-            code_files = [Path(p) for p in files_by_type.get("code", [])]
-            doc_files = [Path(p) for p in files_by_type.get("document", [])]
-            paper_files = [Path(p) for p in files_by_type.get("paper", [])]
-            image_files = [Path(p) for p in files_by_type.get("image", [])]
-            deleted_files = []
-            excluded_files = []
-            graph_stale_sources = []
-            unchanged_total = 0
+        _corpus_graph = _CorpusGraph(_Corpus(root=target, output=graphify_out))
 
-        semantic_files = doc_files + paper_files + image_files
-        # --code-only: index code (pure local AST, no key) and skip the semantic
-        # (doc/paper/image) pass entirely, so a mixed repo doesn't hard-fail when no
-        # LLM backend is configured (#1734). Report what was skipped rather than
-        # silently dropping it.
-        if code_only and semantic_files:
-            print(
-                f"[graphify extract] --code-only: skipping {len(semantic_files)} "
-                f"non-code file(s) ({len(doc_files)} docs, {len(paper_files)} papers, "
-                f"{len(image_files)} images) — no LLM extraction"
-            )
-            semantic_files = []
-            doc_files = []
-            paper_files = []
-            image_files = []
-        if deep_mode and incremental_mode and not code_only:
-            # Deep mode reads/writes its own cache namespace
-            # (cache/semantic-deep/), so the manifest's changed-file gate is
-            # not a valid proxy for deep coverage: over a warm unchanged tree
-            # it dispatches zero files and `--mode deep` silently no-ops
-            # (#1894). Widen the semantic pass to the FULL live
-            # doc/paper/image set (``files_by_type`` from detect_incremental,
-            # which already excludes excluded files) and let the
-            # mode-namespaced cache decide hits/misses — the first deep run
-            # re-dispatches everything (deep namespace cold), later deep runs
-            # hit the deep cache.
-            _deep_all = [
-                Path(p)
-                for _ftype in ("document", "paper", "image")
-                for p in files_by_type.get(_ftype, [])
-            ]
-            if len(_deep_all) != len(semantic_files):
-                print(
-                    f"[graphify extract] deep mode: widening semantic pass from "
-                    f"{len(semantic_files)} changed to {len(_deep_all)} live "
-                    f"doc/paper/image file(s); the deep semantic cache decides "
-                    f"what is re-extracted"
-                )
-            semantic_files = _deep_all
-        if incremental_mode:
-            # Excluded-but-alive files are reported separately from deletions
-            # (#1908): they still exist on disk, the scan just stopped
-            # covering them (ignore rules / --exclude changed).
-            _excl_note = f"; {len(excluded_files)} excluded" if excluded_files else ""
-            print(
-                f"[graphify extract] {len(code_files)} code, {len(doc_files)} docs, "
-                f"{len(paper_files)} papers, {len(image_files)} images changed; "
-                f"{unchanged_total} unchanged; {len(deleted_files)} deleted"
-                f"{_excl_note}"
-            )
-        else:
-            print(
-                f"[graphify extract] found {len(code_files)} code, "
-                f"{len(doc_files)} docs, {len(paper_files)} papers, "
-                f"{len(image_files)} images"
-            )
-        # Surface files that were seen but not classified (extensionless non-shebang
-        # project files like Dockerfile/Makefile, or unsupported extensions), so they
-        # are no longer invisible in graphify's own output (#1692).
-        _unclassified = detection.get("unclassified", []) if isinstance(detection, dict) else []
-        if _unclassified:
-            _names = ", ".join(sorted({Path(p).name for p in _unclassified})[:6])
-            _more = f" (+{len(_unclassified) - 6} more)" if len(_unclassified) > 6 else ""
-            print(
-                f"[graphify extract] {len(_unclassified)} file(s) not classified "
-                f"(no supported extension or shebang), skipped: {_names}{_more}"
-            )
-        # Name the files dropped by the sensitive-file filter so a wrongly-flagged
-        # source/doc is visible, not just a count (#2106). Operational skips
-        # (symlink/office/Workspace) carry a " [reason]" suffix; exclude those here
-        # so this line reports only the security-heuristic drops.
-        _sensitive = detection.get("skipped_sensitive", []) if isinstance(detection, dict) else []
-        _sec = [s for s in _sensitive if " [" not in s]
-        if _sec:
-            _snames = ", ".join(sorted({Path(p).name for p in _sec})[:6])
-            _smore = f" (+{len(_sec) - 6} more)" if len(_sec) > 6 else ""
-            print(
-                f"[graphify extract] {len(_sec)} file(s) skipped as potentially sensitive "
-                f"(rename or move if wrongly flagged): {_snames}{_smore}"
-            )
-        stages.mark("detect")
-
-        # Resolve the LLM backend only now that we know whether the corpus
-        # needs one. A code-only corpus is pure local AST and must not require
-        # an API key; the key is enforced below only when there's LLM work.
-        from graphify.llm import (
-            BACKENDS as _BACKENDS,
-            detect_backend as _detect_backend,
-            estimate_cost as _estimate_cost,
-            extract_corpus_parallel as _extract_corpus_parallel,
-            _format_backend_env_keys,
-            _get_backend_api_key,
-        )
-        needs_llm = bool(semantic_files) or dedup_llm
-        if backend is None and needs_llm:
-            backend = _detect_backend()
-        if backend is not None and backend not in _BACKENDS:
-            print(
-                f"error: unknown backend '{backend}'. "
-                f"Available: {', '.join(sorted(_BACKENDS))}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        if needs_llm:
-            if backend is None:
-                reasons = []
-                if semantic_files:
-                    reasons.append(
-                        f"{len(semantic_files)} doc/paper/image file(s) need semantic extraction"
-                    )
-                if dedup_llm:
-                    reasons.append("--dedup-llm was passed")
-                hint = ""
-                if semantic_files:
-                    hint = (" Or pass --code-only to index just the code "
-                            "(local AST, no key) and skip the non-code files.")
-                print(
-                    "error: no LLM API key found (" + "; ".join(reasons) + "). "
-                    "Set GEMINI_API_KEY or GOOGLE_API_KEY (gemini), MOONSHOT_API_KEY "
-                    "(kimi), ANTHROPIC_API_KEY (claude), OPENAI_API_KEY (openai), "
-                    "DEEPSEEK_API_KEY (deepseek), or pass --backend. A code-only "
-                    "corpus needs no key." + hint,
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            if backend == "ollama":
-                from graphify.llm import _validate_ollama_base_url
-                _oll_url = os.environ.get("OLLAMA_BASE_URL", _BACKENDS["ollama"].get("base_url", ""))
-                try:
-                    _validate_ollama_base_url(_oll_url, warn=False)
-                except ValueError as exc:
-                    print(f"error: {exc}", file=sys.stderr)
-                    sys.exit(2)
-            if not _get_backend_api_key(backend):
-                allow_no_key = False
-                if backend == "ollama":
-                    from urllib.parse import urlparse
-                    ollama_url = os.environ.get(
-                        "OLLAMA_BASE_URL",
-                        _BACKENDS["ollama"].get("base_url", ""),
-                    )
-                    try:
-                        host = (urlparse(ollama_url).hostname or "").lower()
-                    except Exception:
-                        host = ""
-                    allow_no_key = (
-                        host in ("localhost", "127.0.0.1", "::1")
-                        or host.startswith("127.")
-                    )
-                elif backend == "bedrock":
-                    allow_no_key = bool(
-                        os.environ.get("AWS_PROFILE")
-                        or os.environ.get("AWS_REGION")
-                        or os.environ.get("AWS_DEFAULT_REGION")
-                        or os.environ.get("AWS_ACCESS_KEY_ID")
-                    )
-                elif backend == "claude-cli":
-                    import shutil as _shutil
-                    allow_no_key = _shutil.which("claude") is not None
-                    if not allow_no_key:
-                        print(
-                            "error: backend 'claude-cli' requires the `claude` CLI on $PATH "
-                            "(install Claude Code and run `claude` once to authenticate).",
-                            file=sys.stderr,
-                        )
-                        sys.exit(1)
-                if not allow_no_key:
-                    print(
-                        f"error: backend '{backend}' requires {_format_backend_env_keys(backend)} to be set.",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-
-        # Track whether this run's extraction was incomplete (a whole extractor
-        # pass crashed, or some semantic chunks failed). A partial result must not
-        # be force-written over a good complete graph — the final write falls back
-        # to the #479 shrink guard unless --allow-partial is set.
-        _extraction_incomplete = False
-        # A walk that couldn't fully enumerate the corpus (permission-denied
-        # subtree, I/O error) yields a legitimately smaller graph that must not
-        # be force-written over a complete one — same failure class as a crashed
-        # pass. detect()/detect_incremental() already record these; consume them.
-        if detection.get("walk_errors"):
-            _extraction_incomplete = True
-
-        # AST extraction on code files. Empty code list (docs-only corpus) is
-        # the issue #698 case — skip cleanly instead of crashing inside extract().
-        ast_result: dict = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
-        if code_files:
-            from graphify.extract import extract as _ast_extract
-            # Anchor the cache at the output root, not the scanned project:
-            # with --out, a <target>/graphify-out/cache/ would leak a
-            # graphify-out/ dir into a project that asked for external output.
-            # `root` stays the scanned project so source_file/ids relativize
-            # against it; conflating the two basenamed every node (#1941).
-            ast_kwargs: dict = {"cache_root": out_root, "root": target}
-            if cli_max_workers is not None:
-                ast_kwargs["max_workers"] = cli_max_workers
-            print(f"[graphify extract] AST extraction on {len(code_files)} code files...")
+        # Corpus-shaping policy. Replacement is whole by design, so a flag that
+        # changes one half composes with the recorded policy for the other:
+        # --no-gitignore alone must not drop the persisted --exclude patterns
+        # (#1886), and a flag-less run must not clobber a persisted
+        # --no-gitignore back to True (#1971). No flag at all sends no policy
+        # request, which preserves whatever the active generation was built
+        # under.
+        _policy_request = None
+        if cli_excludes or no_gitignore:
             try:
-                ast_result = _ast_extract(code_files, **ast_kwargs)
-            except Exception as exc:
-                print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
-                ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
-                _extraction_incomplete = True  # the whole AST pass was lost
-        stages.mark("AST extract")
-
-        # Semantic extraction on docs/papers/images. Check cache first.
-        from graphify.cache import (
-            check_semantic_cache as _check_semantic_cache,
-            prune_semantic_cache as _prune_semantic_cache,
-            save_semantic_cache as _save_semantic_cache,
-        )
-        sem_result: dict = {
-            "nodes": [], "edges": [], "hyperedges": [],
-            "input_tokens": 0, "output_tokens": 0,
-        }
-        # Semantic files whose extraction truncated this run. They are left
-        # unstamped in the manifest so detect_incremental re-queues them next run
-        # (mirrors the #933 failed-chunk handling); captured below before the
-        # _partial markers are stripped from the corpus.
-        _partial_semantic_files: set[str] = set()
-        sem_cache_hits = 0
-        sem_cache_misses = 0
-        # Deep mode uses its own namespace (cache/semantic-deep/) so deep and
-        # standard results for the same content never shadow each other (#1894).
-        sem_cache_mode = "deep" if deep_mode else None
-        # Entries are attributed to the extraction prompt that produced them, so
-        # a release that changes the prompt re-extracts rather than replaying the
-        # older vintage alongside the new one (#1939). Read and write must pass
-        # the same prompt, or the write lands where the next read won't look.
-        from graphify.llm import _extraction_system as _sem_prompt_for
-        sem_prompt = _sem_prompt_for(deep=deep_mode)
-        if semantic_files:
-            sem_paths_str = [str(p) for p in semantic_files]
-            if force:
-                # --force: skip the cache READ so every semantic file is
-                # re-dispatched; the save below still runs so the fresh
-                # results replace the stale entries.
-                cached_nodes, cached_edges, cached_hyperedges = [], [], []
-                uncached_paths = list(sem_paths_str)
-            else:
-                cached_nodes, cached_edges, cached_hyperedges, uncached_paths = (
-                    _check_semantic_cache(sem_paths_str, root=target, cache_root=out_root,
-                                          mode=sem_cache_mode, prompt=sem_prompt)
+                _active_policy = _corpus_graph.active_build_policy()
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            _policy_request = _ReplaceBuildPolicy(
+                _BuildPolicy(
+                    excludes=tuple(cli_excludes) or _active_policy.excludes,
+                    gitignore=False if no_gitignore else _active_policy.gitignore,
                 )
-            sem_cache_hits = len(semantic_files) - len(uncached_paths)
-            sem_cache_misses = len(uncached_paths)
-            sem_result["nodes"].extend(cached_nodes)
-            sem_result["edges"].extend(cached_edges)
-            sem_result["hyperedges"].extend(cached_hyperedges)
-            if sem_cache_hits:
-                print(f"[graphify extract] semantic cache: {sem_cache_hits} hit / {sem_cache_misses} miss")
+            )
 
-            if uncached_paths:
-                print(f"[graphify extract] semantic extraction on {len(uncached_paths)} files via {backend}...")
-                corpus_kwargs: dict = {
-                    "backend": backend,
-                    "model": model,
-                    "root": target,
-                    "cache_root": out_root,
-                }
-                if deep_mode:
-                    corpus_kwargs["deep_mode"] = True
-                if cli_token_budget is not None:
-                    corpus_kwargs["token_budget"] = cli_token_budget
-                if cli_max_concurrency is not None:
-                    corpus_kwargs["max_concurrency"] = cli_max_concurrency
+        # --code-only requests no Semantic provider at all, which is what makes
+        # it free: with no provider the operation never asks for an API key, and
+        # documents are represented by whatever structure can be derived locally.
+        _provider = None
+        if not code_only:
+            from graphify.semantic_provider import LlmSemanticProvider
 
-                # Minimal progress callback so the CLI is no longer silent
-                # during long local-inference runs (issue #792 addendum).
-                # Also track per-chunk success so we can fail loudly when
-                # every chunk errors (e.g. missing backend SDK package).
-                _chunk_stats = {"total": 0, "succeeded": 0}
-                def _progress(idx: int, total: int, _result: dict) -> None:
-                    _chunk_stats["total"] = total
-                    _chunk_stats["succeeded"] += 1
-                    print(
-                        f"[graphify extract] chunk {idx + 1}/{total} done",
-                        flush=True,
-                    )
-                corpus_kwargs["on_chunk_done"] = _progress
+            _provider = LlmSemanticProvider(
+                backend=backend,
+                model=model,
+                deep=deep_mode,
+                refresh=force,
+                token_budget=cli_token_budget,
+                max_concurrency=cli_max_concurrency,
+                on_progress=lambda done, total: print(
+                    f"{_EXTRACT_PREFIX}chunk {done}/{total} done", flush=True
+                ),
+            )
 
-                try:
-                    fresh = _extract_corpus_parallel(
-                        [Path(p) for p in uncached_paths],
-                        **corpus_kwargs,
-                    )
-                except ImportError as exc:
-                    print(f"error: {exc}", file=sys.stderr)
-                    sys.exit(1)
-                except Exception as exc:
-                    print(
-                        f"[graphify extract] semantic extraction failed: {exc}",
-                        file=sys.stderr,
-                    )
-                    fresh = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
-                    _extraction_incomplete = True  # the semantic pass crashed
-
-                # on_chunk_done only fires after a chunk succeeds. If fresh
-                # semantic extraction was requested and no chunks completed,
-                # fail instead of writing an AST-only graph with exit 0.
-                if uncached_paths and _chunk_stats["succeeded"] == 0:
-                    print(
-                        f"[graphify extract] error: all semantic chunks failed "
-                        f"for backend '{backend}' ({len(uncached_paths)} uncached files) - "
-                        f"see per-chunk errors above. If you see 'requires the X package', "
-                        f"run `pip install X` and retry.",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-                # Some (but not all) chunks failed — the graph is missing nodes
-                # from the failed chunks, so it must not clobber a larger complete
-                # graph without an explicit --allow-partial override.
-                if _chunk_stats["total"] and _chunk_stats["succeeded"] < _chunk_stats["total"]:
-                    _extraction_incomplete = True
-                # Which files truncated this run (item markers + the empty-parse
-                # _partial_files set). Computed BEFORE the save so it can be passed
-                # as partial_source_files: without it, a file whose only truncated
-                # chunk parsed empty (so it has no item markers here) would be
-                # written as a complete cache entry, re-promoting it (#1950).
-                from graphify.llm import (
-                    _partial_source_files as _partial_sf,
-                    _strip_partial_markers as _strip_partial,
-                )
-                _partial_semantic_files = set(_partial_sf(fresh))
-                try:
-                    _save_semantic_cache(
-                        fresh.get("nodes", []),
-                        fresh.get("edges", []),
-                        fresh.get("hyperedges", []),
-                        root=target,
-                        cache_root=out_root,
-                        allowed_source_files=uncached_paths,
-                        mode=sem_cache_mode,
-                        prompt=sem_prompt,
-                        partial_source_files=_partial_semantic_files or None,
-                    )
-                except Exception as exc:
-                    print(f"[graphify extract] warning: could not write semantic cache: {exc}", file=sys.stderr)
-                # Strip the markers before the corpus feeds the graph so the
-                # internal flag never leaks into graph.json.
-                _strip_partial(fresh)
-                sem_result["nodes"].extend(fresh.get("nodes", []))
-                sem_result["edges"].extend(fresh.get("edges", []))
-                sem_result["hyperedges"].extend(fresh.get("hyperedges", []))
-                sem_result["input_tokens"] += fresh.get("input_tokens", 0)
-                sem_result["output_tokens"] += fresh.get("output_tokens", 0)
-
-        # Prune orphaned semantic cache entries. The semantic cache is
-        # content-hash-keyed and unversioned, so it is never swept by the AST
-        # version-cleanup: every content change or file deletion leaves a
-        # permanent orphan that accumulates unbounded (#1527). Sweep it against
-        # the FULL live document set (``files_by_type`` — present in both the
-        # incremental and full branches), NOT the incremental ``semantic_files``
-        # changed-subset, which would delete every unchanged doc's valid entry.
-        # Best-effort: a prune failure must never break extraction.
-        # Hash keys are anchored to the corpus (``target``) — the same anchor
-        # the cache read/write above use — while the stat-index artifact
-        # follows the cache location (``out_root``). Anchoring these hashes to
-        # ``out_root`` instead would mismatch every key under ``--out`` and
-        # sweep the entire fresh cache as orphaned (#1990/#1991).
-        try:
-            from graphify.cache import file_hash as _file_hash
-            _live_hashes: set[str] = set()
-            for _kind in ("document", "paper", "image"):
-                for _fp in files_by_type.get(_kind, []):
-                    _abs = Path(_fp)
-                    if not _abs.is_absolute():
-                        _abs = Path(target) / _abs
-                    if not _abs.is_file():
-                        continue  # deleted/missing — leave out so its entry is pruned
-                    try:
-                        _live_hashes.add(_file_hash(_abs, target, cache_root=out_root))
-                    except OSError:
-                        pass
-            # A pathless database extraction has no filesystem corpus to sweep.
-            if has_path:
-                _prune_semantic_cache(out_root, _live_hashes)
-        except Exception as exc:
-            print(f"[graphify extract] warning: could not prune semantic cache: {exc}", file=sys.stderr)
-        stages.mark("semantic extract")
-
-        pg_result: dict = {"nodes": [], "edges": []}
+        _sources: list = []
+        if _provider is not None:
+            _sources.append(_SemanticSource(provider=_provider))
         if cli_postgres_dsn is not None:
-            from graphify.pg_introspect import introspect_postgres
-            print(f"[graphify extract] introspecting PostgreSQL schema...")
-            try:
-                pg_result = introspect_postgres(cli_postgres_dsn)
-            except (ConnectionError, ImportError) as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                sys.exit(1)
-            print(f"[graphify extract] PostgreSQL: {len(pg_result['nodes'])} nodes, "
-                  f"{len(pg_result['edges'])} edges")
-
-        cargo_result: dict = {"nodes": [], "edges": []}
+            _sources.append(_PostgresSource(dsn=cli_postgres_dsn))
         if cli_cargo:
-            from graphify.cargo_introspect import introspect_cargo
-            print("[graphify extract] introspecting Cargo workspace...")
-            try:
-                cargo_result = introspect_cargo(target)
-            except (ConnectionError, ImportError, OSError) as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                sys.exit(1)
-            print(f"[graphify extract] Cargo: {len(cargo_result['nodes'])} nodes, "
-                  f"{len(cargo_result['edges'])} edges")
+            _sources.append(_CargoSource())
+        if google_workspace:
+            _sources.append(_GoogleWorkspaceSource())
 
-        # Merge AST + semantic + pg_result + cargo_result. Order matters for deduplication: passing AST
-        # first means semantic node attributes win on collision (richer labels
-        # for symbols also referenced in docs). Hyperedges only come from the
-        # semantic side.
-        merged: dict = {
-            "nodes": list(ast_result.get("nodes", [])) + list(sem_result.get("nodes", [])) + list(pg_result.get("nodes", [])) + list(cargo_result.get("nodes", [])),
-            "edges": list(ast_result.get("edges", [])) + list(sem_result.get("edges", [])) + list(pg_result.get("edges", [])) + list(cargo_result.get("edges", [])),
-            "hyperedges": list(sem_result.get("hyperedges", [])),
-            "input_tokens": ast_result.get("input_tokens", 0) + sem_result.get("input_tokens", 0),
-            "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
-        }
+        if force:
+            print(
+                "[graphify extract] --force: re-interpreting every semantic "
+                "source; a smaller graph is authorized"
+            )
+        print(f"[graphify extract] scanning {target}")
+
+        # Completion is stated rather than defaulted, and there is deliberately
+        # no flag for the other half of the union: this request carries live
+        # in-process evidence sources, so no other executor could ever carry out
+        # a durable record of it. Waiting until the request is covered is the
+        # only honest shape a Full extraction has.
+        _outcome = _corpus_graph.full_extraction(
+            _FullExtractionRequest(
+                sources=tuple(_sources),
+                build_policy=_policy_request,
+                force=force,
+                allow_partial_publication=cli_allow_partial,
+            ),
+            completion=_WaitUntilCovered(),
+            observer=_ExtractionProgress(stages, code_only=code_only),
+        )
+        if not _render_full_extraction(_outcome):
+            stages.total()
+            sys.exit(1)
+        stages.mark("publish")
 
         graph_json_path = graphify_out / "graph.json"
         analysis_path = graphify_out / ".graphify_analysis.json"
 
-        # Build a manifest-safe files dict: only stamp semantic_hash for files
-        # that actually produced output (cache hit or fresh extraction). Files
-        # whose chunk failed have no source_file entry in sem_result — leaving
-        # their semantic_hash empty so detect_incremental re-queues them (#933).
-        # Path normalization against the scan root happens inside the helper
-        # (#1897) so fresh root-relative source_files match detect()'s
-        # absolute file lists.
-        _manifest_files = _stamped_manifest_files(files_by_type, sem_result, target,
-                                                   partial_source_files=_partial_semantic_files)
-
-        # Files dispatched this run but dropped by _stamped_manifest_files
-        # above (failed chunk, LLM omission, or any future exclusion) still
-        # carry a stale semantic_hash from a prior successful run in the
-        # on-disk manifest; save_manifest's seed loop would otherwise copy it
-        # verbatim and mask the omission (#1948). Derived from semantic_files
-        # — what was actually SENT to the backend this run (narrowed by the
-        # incremental gate and --code-only, widened by deep mode) — NOT from
-        # files_by_type: the full live corpus includes untouched files that
-        # were never dispatched, and clearing those would blank the whole
-        # manifest on every partial incremental run, forcing a full-corpus
-        # re-extraction on the next one.
-        _stamped_semantic = {
-            f for _flist in _manifest_files.values() for f in _flist
-        }
-        _cleared_semantic = {str(p) for p in semantic_files} - _stamped_semantic
-
-        # Full-scan manifest saves prune rows for in-root files that left the
-        # scan corpus but still exist on disk (#1908). The corpus must be the
-        # RAW detect output (files_by_type), NOT the #933-stamp-filtered
-        # _manifest_files above — pruning to the filtered set would erase
-        # failed-chunk/omitted-doc rows and every doc row on --code-only runs.
-        _scan_corpus = (
-            {f for _fl in files_by_type.values() for f in _fl}
-            if has_path else None
-        )
-
         if no_cluster:
-            # --no-cluster: dump the raw merged extraction as graph.json.
-            # No NetworkX, no community detection, no analysis sidecar.
-            # Dedupe nodes (by id) and parallel edges so the raw output matches the
-            # clustered path (whose DiGraph collapses both) and stays deterministic
-            # across modes (#1317; node dedup also collapses shared Swift module
-            # anchors emitted per importing file, #1327).
-            from graphify.build import dedupe_edges as _dedupe_edges, dedupe_nodes as _dedupe_nodes
-            from graphify.export import (
-                existing_graph_node_count as _existing_graph_node_count,
-            )
-            if (
-                incremental_mode
-                and not code_files
-                and not semantic_files
-                and not deleted_files
-                and not pg_result.get("nodes")
-                and not pg_result.get("edges")
-                and not cargo_result.get("nodes")
-                and not cargo_result.get("edges")
-            ):
-                # An exclusion-only change reaches this gate (excluded files
-                # are deliberately NOT in deleted_files, #1908) but must still
-                # scrub the newly-excluded sources from the raw graph (#1909).
-                # This path never runs build_merge, so prune in place.
-                if graph_stale_sources:
-                    _n_pruned = _prune_graph_json_sources(
-                        existing_graph_path, graph_stale_sources
-                    )
-                    if _n_pruned:
-                        print(
-                            f"[graphify extract] pruned {_n_pruned} node(s) from "
-                            f"{len(graph_stale_sources)} source file(s) no longer "
-                            "in the scan (deleted or excluded)."
-                        )
-                print(
-                    "[graphify extract] no incremental changes detected "
-                    "(--no-cluster); outputs left untouched."
-                )
-                from graphify.generation import (
-                    Corpus,
-                    CorpusGraph,
-                    FullExtractionRequest,
-                    OperationFailed,
-                )
-                from graphify.generation._publication import (
-                    _ManifestUpdate,
-                    _Publication,
-                )
-
-                _manifest_outcome = CorpusGraph(
-                    Corpus(root=target, output=graphify_out)
-                ).full_extraction(
-                    FullExtractionRequest(),
-                    _publication=_Publication(
-                        manifest=_ManifestUpdate(
-                            files=_manifest_files,
-                            kind="both",
-                            root=target,
-                            scan_corpus=_scan_corpus,
-                            clear_semantic=_cleared_semantic,
-                        )
-                    ),
-                )
-                if isinstance(_manifest_outcome, OperationFailed):
-                    print(
-                        "[graphify extract] warning: could not write manifest: "
-                        f"{_manifest_outcome.reason}",
-                        file=sys.stderr,
-                    )
-                stages.total()
-                sys.exit(0)
-
-            if incremental_mode:
-                # #2169: this raw path used to write ONLY this run's extraction
-                # over graph.json — on an incremental run that is just the
-                # changed files, silently dropping every node/edge owned by an
-                # unchanged file. Merge the existing graph forward first, with
-                # the same replace/prune semantics as the clustered path's
-                # build_merge: re-extracted sources replaced, deleted +
-                # excluded + graph-stale sources pruned, everything else
-                # carried. Survivors are prepended, so the dedupe below keeps
-                # this run's fresh attributes for re-extracted nodes.
-                from graphify.build import merge_raw_extraction as _merge_raw_extraction
-                _raw_prune_sources: list[str] = list(deleted_files)
-                for _src in list(excluded_files) + graph_stale_sources:
-                    if _src not in _raw_prune_sources:
-                        _raw_prune_sources.append(_src)
-                try:
-                    merged = _merge_raw_extraction(
-                        merged,
-                        graph_path=existing_graph_path,
-                        prune_sources=_raw_prune_sources or None,
-                        root=target,
-                    )
-                except RuntimeError as exc:
-                    # Existing graph present but unparseable: refuse to
-                    # raw-dump this run's partial extraction over it.
-                    print(f"error: {exc}", file=sys.stderr)
-                    sys.exit(1)
-            merged["nodes"] = _dedupe_nodes(merged["nodes"])
-            merged["edges"] = _dedupe_edges(merged["edges"])
-            # Disambiguate colliding-basename file-node labels (#2032). This raw
-            # --no-cluster path bypasses build_from_json (where the clustered path
-            # gets this), so apply it directly on the merged node list.
-            from graphify.build import disambiguate_file_labels_in_nodes as _disamb_labels
-            _disamb_labels(merged["nodes"])
-            # Backfill source_file from endpoint nodes — this raw path bypasses
-            # build_from_json's backfill, and semantic edges sometimes omit it (#1279).
-            _node_sf = {n.get("id"): n.get("source_file") for n in merged["nodes"]}
-            for _e in merged["edges"]:
-                if not _e.get("source_file"):
-                    _e["source_file"] = (
-                        _node_sf.get(_e.get("source")) or _node_sf.get(_e.get("target")) or ""
-                    )
-            # RT-parity for the raw path: an incomplete build must not force a
-            # partial graph over a larger complete one here either. The clustered
-            # path gets this from to_json's #479 guard; this path never calls
-            # to_json, so replicate the shrink check against the existing file and
-            # exit before the write/manifest unless --allow-partial is set.
-            if _extraction_incomplete and not cli_allow_partial:
-                from graphify.export import MALFORMED_GRAPH as _MALFORMED_GRAPH
-                _existing_n = _existing_graph_node_count(graph_json_path)
-                _malformed = _existing_n is _MALFORMED_GRAPH
-                _shrinks = isinstance(_existing_n, int) and len(merged["nodes"]) < _existing_n
-                if _malformed or _shrinks:
-                    _detail = (
-                        f"the existing {graph_json_path} is present but unparseable "
-                        "(corrupt or a mid-write), so a shrink cannot be ruled out"
-                        if _malformed
-                        else f"smaller than the existing {graph_json_path} "
-                        f"({len(merged['nodes'])} < {_existing_n} nodes)"
-                    )
-                    print(
-                        "[graphify extract] error: extraction was incomplete (an AST/"
-                        f"semantic pass failed) and the resulting --no-cluster graph is {_detail}. "
-                        "Refusing to overwrite a complete graph with a partial one. Re-run after "
-                        "fixing the failures, or pass --allow-partial to overwrite anyway.",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-            from graphify.generation import (
-                Corpus,
-                CorpusGraph,
-                FullExtractionRequest,
-                OperationFailed,
-                PublicationRefused,
-            )
-            from graphify.generation._publication import (
-                _CanonicalArtifact,
-                _GraphData,
-                _ManifestUpdate,
-                _Publication,
-            )
-
-            _corpus_graph = CorpusGraph(Corpus(root=target, output=graphify_out))
-            _raw_outcome = _corpus_graph.full_extraction(
-                FullExtractionRequest(),
-                _publication=_Publication(
-                    graph=_GraphData(
-                        merged,
-                        force=cli_allow_partial or not _extraction_incomplete,
-                    ),
-                    # Record the scan root so later merge/update paths can
-                    # relativize deletions under custom --out (#2012/#1571).
-                    root_marker=str(Path(target).resolve()),
-                    # A pathless database graph has no file manifest. Retire it
-                    # only after backup custody has captured the prior state.
-                    retire=(
-                        frozenset({_CanonicalArtifact.MANIFEST})
-                        if not has_path
-                        else frozenset()
-                    ),
-                    protect_previous=True,
-                ),
-            )
-            if isinstance(_raw_outcome, (PublicationRefused, OperationFailed)):
-                print(f"[graphify extract] error: {_raw_outcome.reason}", file=sys.stderr)
-                sys.exit(1)
-            stages.mark("write")
-            cost = _estimate_cost(
-                backend, merged["input_tokens"], merged["output_tokens"]
-            )
+            _nodes, _edges = _published_graph_size(graph_json_path)
             print(
                 f"[graphify extract] wrote {graph_json_path} — "
-                f"{len(merged['nodes'])} nodes, {len(merged['edges'])} edges "
-                f"(no clustering)"
+                f"{_nodes} nodes, {_edges} edges (no clustering)"
             )
-            if merged["input_tokens"] or merged["output_tokens"]:
-                print(
-                    f"[graphify extract] tokens: "
-                    f"{merged['input_tokens']:,} in / "
-                    f"{merged['output_tokens']:,} out, "
-                    f"est. cost: ${cost:.4f}"
-                )
-            if has_path:
-                _manifest_outcome = _corpus_graph.full_extraction(
-                    FullExtractionRequest(),
-                    _publication=_Publication(
-                        manifest=_ManifestUpdate(
-                            files=_manifest_files,
-                            kind="both",
-                            root=target,
-                            scan_corpus=_scan_corpus,
-                            clear_semantic=_cleared_semantic,
-                        )
-                    ),
-                )
-                if isinstance(_manifest_outcome, OperationFailed):
-                    print(
-                        "[graphify extract] warning: could not write manifest: "
-                        f"{_manifest_outcome.reason}",
-                        file=sys.stderr,
-                    )
-            if global_merge:
-                from graphify.global_graph import global_add as _global_add
-                _tag = global_repo_tag or target.name
-                try:
-                    result = _global_add(graphify_out / "graph.json", _tag)
-                    if result["skipped"]:
-                        print(f"[graphify global] '{_tag}' unchanged since last add - skipped.")
-                    else:
-                        print(f"[graphify global] '{_tag}' merged into global graph "
-                              f"(+{result['nodes_added']} nodes, -{result['nodes_removed']} pruned).")
-                except Exception as exc:
-                    print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
+        elif not _publish_clustered_generation(
+            _corpus_graph,
+            graph_json_path,
+            resolution=cli_resolution,
+            exclude_hubs=cli_exclude_hubs,
+            stages=stages,
+        ):
             stages.total()
-            sys.exit(0)
-
-        # Build graph + cluster + score + write.
-        from graphify.build import (
-            build as _build,
-            build_merge as _build_merge,
-        )
-        from graphify.cluster import cluster as _cluster, score_all as _score_all
-        from graphify.analyze import god_nodes as _god_nodes, surprising_connections as _surprising
-        dedup_backend = backend if dedup_llm else None
-        if incremental_mode:
-            # Prune everything the current scan no longer covers: genuinely
-            # deleted manifest rows, excluded-but-alive manifest rows (#1908),
-            # and the graph's own stale sources — which catches files that
-            # became excluded without ever being manifest-listed (#1909).
-            _prune_sources: list[str] = list(deleted_files)
-            for _src in list(excluded_files) + graph_stale_sources:
-                if _src not in _prune_sources:
-                    _prune_sources.append(_src)
-            G = _build_merge(
-                [merged],
-                graph_path=existing_graph_path,
-                prune_sources=_prune_sources or None,
-                dedup=True,
-                dedup_llm_backend=dedup_backend,
-                root=target,
-            )
+            sys.exit(1)
         else:
-            G = _build([merged], dedup=True, dedup_llm_backend=dedup_backend, root=target)
-        stages.mark("build")
-        if G.number_of_nodes() == 0:
-            print(
-                "[graphify extract] graph is empty — extraction produced no nodes. "
-                "Possible causes: all files skipped, binary-only corpus, or LLM "
-                "returned no edges.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            print(f"[graphify extract] wrote {analysis_path}")
 
-        communities = _cluster(G, resolution=cli_resolution, exclude_hubs_percentile=cli_exclude_hubs)
-        stages.mark("cluster")
-        cohesion = _score_all(G, communities)
-        try:
-            gods = _god_nodes(G)
-        except Exception:
-            gods = []
-        try:
-            surprises = _surprising(G, communities)
-        except Exception:
-            surprises = []
-        stages.mark("analyze")
-
-        # force=True bypasses the #479 shrink guard entirely. A full build
-        # legitimately shrinks (fuzzy dedup collapse, deleted code) so it keeps
-        # force=True — EXCEPT when this run's extraction was incomplete (an
-        # extractor pass crashed or some semantic chunks failed). Then a partial
-        # graph could silently overwrite a good complete one, so fall back to the
-        # shrink guard (force=False) unless the user opts in with --allow-partial.
-        #
-        # Both write paths are guarded: the clustered path here via to_json's
-        # #479 check, and the `--no-cluster` raw-dump path above via the same
-        # shrink check against the existing file (existing_graph_node_count).
-        #
-        # Trade-off: this reuses to_json's coarse node-count guard, not the
-        # per-source shrink accounting a Code update applies. On an incremental run
-        # a legitimate deletion that coincides with an unrelated transient chunk
-        # failure can therefore be refused here — recoverable by re-running or
-        # passing --allow-partial (the good graph is preserved and the manifest
-        # is not stamped, so the retry re-extracts).
-        _force_write = cli_allow_partial or not _extraction_incomplete
-        analysis = {
-            "communities": {str(k): v for k, v in communities.items()},
-            "cohesion": {str(k): v for k, v in cohesion.items()},
-            "gods": gods,
-            "surprises": surprises,
-            "tokens": {
-                "input": merged["input_tokens"],
-                "output": merged["output_tokens"],
-            },
-        }
-        from graphify.generation import (
-            Corpus,
-            CorpusGraph,
-            FullExtractionRequest,
-            OperationFailed,
-            PublicationRefused,
-        )
-        from graphify.generation._publication import (
-            _CanonicalArtifact,
-            _GraphModel,
-            _ManifestUpdate,
-            _Publication,
-        )
-
-        _corpus_graph = CorpusGraph(Corpus(root=target, output=graphify_out))
-        _full_outcome = _corpus_graph.full_extraction(
-            FullExtractionRequest(),
-            _publication=_Publication(
-                graph=_GraphModel(G, communities, force=_force_write),
-                analysis=analysis,
-                # Persist the scan root so build_merge can relativize deletions
-                # under a custom --out (#2012/#1571).
-                root_marker=str(Path(target).resolve()),
-                semantic_marker=(
-                    {"output_tokens": merged["output_tokens"]}
-                    if merged.get("output_tokens", 0) > 0
-                    else None
-                ),
-                # Preserve the established backup-before-invalidation order for
-                # pathless database extractions.
-                retire=(
-                    frozenset({_CanonicalArtifact.MANIFEST})
-                    if not has_path
-                    else frozenset()
-                ),
-                protect_previous=True,
-            ),
-        )
-        if isinstance(_full_outcome, PublicationRefused):
-            # The shrink guard refused: this partial build is smaller than the
-            # existing graph. Exit before writing the manifest/marker below, which
-            # would otherwise stamp these files as done and make the next
-            # incremental run skip re-extracting them (poisoning the manifest
-            # against the graph we declined to write). Exit non-zero so a retry
-            # re-attempts.
-            print(
-                "[graphify extract] error: extraction was incomplete (an AST/semantic "
-                f"pass failed) and the resulting graph is smaller than the existing "
-                f"{graph_json_path}. Refusing to overwrite a complete graph with a "
-                "partial one. Re-run after fixing the failures, or pass --allow-partial "
-                f"to overwrite anyway. ({_full_outcome.reason})",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        if isinstance(_full_outcome, OperationFailed):
-            print(
-                f"[graphify extract] error: publication failed: {_full_outcome.reason}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        stages.mark("export")
+        # After the local generation is final, never before: an unavailable
+        # global graph must not be able to affect what this Corpus published.
         if global_merge:
             from graphify.global_graph import global_add as _global_add
             _tag = global_repo_tag or target.name
             try:
-                result = _global_add(graphify_out / "graph.json", _tag)
+                result = _global_add(graph_json_path, _tag)
                 if result["skipped"]:
                     print(f"[graphify global] '{_tag}' unchanged since last add - skipped.")
                 else:
@@ -3769,50 +3002,26 @@ def dispatch_command(cmd: str) -> None:
                           f"(+{result['nodes_added']} nodes, -{result['nodes_removed']} pruned).")
             except Exception as exc:
                 print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
-        if has_path:
-            _manifest_outcome = _corpus_graph.full_extraction(
-                FullExtractionRequest(),
-                _publication=_Publication(
-                    manifest=_ManifestUpdate(
-                        files=_manifest_files,
-                        kind="both",
-                        root=target,
-                        scan_corpus=_scan_corpus,
-                        clear_semantic=_cleared_semantic,
-                    )
-                ),
-            )
-            if isinstance(_manifest_outcome, OperationFailed):
-                print(
-                    "[graphify extract] warning: could not write manifest: "
-                    f"{_manifest_outcome.reason}",
-                    file=sys.stderr,
-                )
 
-        cost = _estimate_cost(backend, merged["input_tokens"], merged["output_tokens"])
-        print(
-            f"[graphify extract] wrote {graph_json_path}: "
-            f"{G.number_of_nodes()} nodes, {G.number_of_edges()} edges, "
-            f"{len(communities)} communities"
-        )
-        print(f"[graphify extract] wrote {analysis_path}")
-        if incremental_mode:
-            _excl_note = f", {len(excluded_files)} excluded" if excluded_files else ""
-            print(
-                f"[graphify extract] incremental summary: "
-                f"{sem_cache_hits + unchanged_total} files cached/unchanged, "
-                f"{len(code_files) + sem_cache_misses} re-extracted, "
-                f"{len(deleted_files)} deleted{_excl_note}"
-            )
-        elif sem_cache_hits:
-            print(f"[graphify extract] semantic cache: {sem_cache_hits} cached, {sem_cache_misses} re-extracted")
-        if merged["input_tokens"] or merged["output_tokens"]:
-            print(
-                f"[graphify extract] tokens: "
-                f"{merged['input_tokens']:,} in / "
-                f"{merged['output_tokens']:,} out, "
-                f"est. cost (~{backend}): ${cost:.4f}"
-            )
+        if _provider is not None:
+            if _provider.cache_hits or _provider.cache_misses:
+                print(
+                    f"[graphify extract] semantic cache: {_provider.cache_hits} "
+                    f"cached, {_provider.cache_misses} re-extracted"
+                )
+            if _provider.input_tokens or _provider.output_tokens:
+                from graphify.llm import estimate_cost as _estimate_cost
+
+                cost = _estimate_cost(
+                    _provider.backend or "",
+                    _provider.input_tokens,
+                    _provider.output_tokens,
+                )
+                print(
+                    f"[graphify extract] tokens: {_provider.input_tokens:,} in / "
+                    f"{_provider.output_tokens:,} out, est. cost "
+                    f"(~{_provider.backend}): ${cost:.4f}"
+                )
         # extract intentionally stops at graph.json + analysis; the report and
         # community labels are produced by `cluster-only` (or an agent's Step 5).
         # Point standalone users at it so communities get named (#1097).
@@ -3822,6 +3031,9 @@ def dispatch_command(cmd: str) -> None:
             "to generate GRAPH_REPORT.md and name communities"
         )
         stages.total()
+        # The success half of the exit contract scripts read, kept explicit so
+        # both the clustered and --no-cluster shapes end the same way.
+        sys.exit(0)
 
     elif cmd == "cache-check":
         # graphify cache-check <files_from> [--root <dir>] [--mode <m> | --deep]

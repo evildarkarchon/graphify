@@ -48,6 +48,7 @@ from graphify.generation._contributions import (
 )
 from graphify.generation._layout import _PublicationLayout
 from graphify.generation._manifest import _stamped_manifest_files
+from graphify.generation._observations import _Observations
 from graphify.generation._publication import (
     _CanonicalArtifact,
     _GraphData,
@@ -74,6 +75,9 @@ from graphify.generation._types import (
     BuildPolicy,
     BuildPolicyRequest,
     CargoSource,
+    CorpusDiscovered,
+    EvidenceCollected,
+    EvidenceOrigin,
     EvidenceSource,
     ClearBuildPolicy,
     Corpus,
@@ -82,11 +86,13 @@ from graphify.generation._types import (
     OperationFailed,
     PostgresSource,
     PublicationRefused,
+    PublicationStarted,
     ReplaceBuildPolicy,
     SemanticProvider,
     SemanticRequest,
     SemanticSource,
     SourceEvidence,
+    SourcesInterpreted,
     TerminalOutcome,
 )
 
@@ -121,13 +127,20 @@ class _SourceUnavailable(Exception):
 def _execute_full_extraction(
     corpus: Corpus,
     request: FullExtractionRequest,
+    observations: _Observations | None = None,
 ) -> TerminalOutcome:
     """Run one Full extraction end to end and publish through the owning module.
 
     Every requested evidence source is gathered before anything is staged, so a
     source that cannot answer leaves the active Graph generation exactly as it
     was rather than half-replaced.
+
+    ``observations`` receives the ordered lifecycle facts a caller renders
+    progress from. It is reporting only: nothing here consults it, and a failing
+    adapter is absorbed by :class:`_Observations` rather than reaching the
+    operation.
     """
+    observe = observations if observations is not None else _Observations()
     # Recovery precedes every read of the active generation, not just the write:
     # reconciliation below decides what to retire from the active ledger and
     # graph, so it must never observe an interrupted publication's state.
@@ -135,7 +148,7 @@ def _execute_full_extraction(
     if recovery is not None:
         return recovery
     try:
-        planned = _plan_full_extraction(corpus, request)
+        planned = _plan_full_extraction(corpus, request, observe)
     except _SourceUnavailable as exc:
         return OperationFailed(f"a requested evidence source could not complete: {exc}")
     except Exception as exc:
@@ -147,16 +160,21 @@ def _execute_full_extraction(
         return OperationFailed(f"could not prepare the Full extraction: {exc}")
     if isinstance(planned, PublicationRefused):
         return planned
+    # Announced here rather than inside the planner: everything the operation
+    # was asked for has completed, and the only thing left is the commit itself.
+    observe.emit(PublicationStarted())
     return _Publisher(corpus).publish(planned, operation="full-extraction")
 
 
 def _plan_full_extraction(
     corpus: Corpus,
     request: FullExtractionRequest,
+    observe: _Observations | None = None,
 ) -> _Publication | PublicationRefused:
     """Reconcile every requested source into the publication one run should make."""
     root = corpus.root
     output = corpus.output
+    observe = observe if observe is not None else _Observations()
     # Resolve active artifact locations exactly as the next transaction will, so
     # reconciliation reads the same files publication is going to replace.
     layout = _PublicationTransaction.active_layout(corpus)
@@ -180,6 +198,20 @@ def _plan_full_extraction(
     walk_errors = detection.get("walk_errors") or ()
     failed_exports = (
         _failed_google_workspace_exports(detection) if google_workspace else ()
+    )
+    semantic_corpus = _semantic_corpus(detection, root)
+    observe.emit(
+        CorpusDiscovered(
+            sources=sum(len(group) for group in detection["files"].values()),
+            semantic_sources=len(semantic_corpus),
+            unclassified=tuple(
+                str(entry) for entry in detection.get("unclassified") or ()
+            ),
+            skipped=tuple(
+                str(entry) for entry in detection.get("skipped_sensitive") or ()
+            ),
+            complete=not walk_errors and not failed_exports,
+        )
     )
     # Discovery could not describe the whole Corpus: a location it could not
     # enumerate, or a Google Workspace shortcut that produced no document. The
@@ -205,7 +237,6 @@ def _plan_full_extraction(
         )
 
     live = _live_source_identities(detection, root)
-    semantic_corpus = _semantic_corpus(detection, root)
     provider = _semantic_provider(request)
 
     # Every requested source is gathered here, before a single artifact is
@@ -221,6 +252,14 @@ def _plan_full_extraction(
         if provider is not None
         else frozenset()
     )
+    if provider is not None:
+        observe.emit(
+            SourcesInterpreted(
+                requested=len(semantic_corpus),
+                interpreted=len(interpreted),
+            )
+        )
+        observe.emit(_collected_from_evidence(EvidenceOrigin.SEMANTIC, interpreted.values()))
     if uninterpreted and not request.allow_partial_publication:
         # The provider was asked about these sources and did not report them as
         # completely interpreted. Publishing anyway would present a generation
@@ -249,10 +288,11 @@ def _plan_full_extraction(
         if owned
         else {"nodes": [], "edges": [], "hyperedges": []}
     )
+    observe.emit(_collected_from_result(EvidenceOrigin.CORPUS, structural_result))
     # Source systems answer in the same node/edge shape as structural
     # extraction and attribute their evidence to the manifest or address that
     # produced it, so one grouping pass covers all of them.
-    system_result = _collect_source_systems(request, corpus)
+    system_result = _collect_source_systems(request, corpus, observe)
     structural = _structural_contributions(
         _combined(structural_result, system_result)
     )
@@ -356,10 +396,20 @@ def _plan_full_extraction(
     # The ledger is the authoritative graph evidence, so an unchanged ledger
     # means the Graph generation itself did not change: leave graph.json and the
     # ledger exactly as published so a Corpus-state advance causes no output
-    # churn. A missing or unreadable graph still has to be rematerialized.
-    graph_changed = not graph_path.is_file() or not _ledger_matches(
-        layout.path_for(_CanonicalArtifact.CONTRIBUTIONS),
-        prepared,
+    # churn. A missing or unreadable graph still has to be rematerialized — and
+    # so does one that no longer materializes the ledger, because "the ledger did
+    # not change" only licenses leaving the graph alone while the graph on disk
+    # still is that ledger's view. Rewriting it from this run's own reconciliation
+    # is the whole point: evidence nothing produced must not survive by having
+    # been written into the view directly.
+    ledger_path = layout.path_for(_CanonicalArtifact.CONTRIBUTIONS)
+    graph_changed = (
+        not graph_path.is_file()
+        or not _ledger_matches(ledger_path, prepared)
+        or not _PublicationTransaction.graph_materializes_contributions(
+            graph_path,
+            ledger_path,
+        )
     )
     retire = set(_RETIRED_BY_RAW_PUBLICATION if graph_changed else ())
     if clear_policy:
@@ -387,6 +437,7 @@ def _plan_full_extraction(
         root_marker=(
             str(root) if _root_marker_advances(layout, str(root)) else None
         ),
+        semantic_marker=_semantic_marker(layout, bool(interpreted)),
         needs_update=_pending_marker(
             layout,
             # Incomplete discovery is outstanding work the ledger cannot express:
@@ -629,12 +680,15 @@ def _combined(*results: Mapping[str, Any]) -> dict[str, list[Any]]:
 def _collect_source_systems(
     request: FullExtractionRequest,
     corpus: Corpus,
+    observe: _Observations,
 ) -> dict[str, list[Any]]:
     """Collect evidence from every requested source system, or raise.
 
     Each system is asked in turn and all of them must answer, because a
     generation missing one requested system's evidence would be indistinguishable
-    from one where that system genuinely has nothing to say.
+    from one where that system genuinely has nothing to say. Each one reports
+    what it contributed as it finishes, so a caller sees the systems complete
+    one by one rather than only learning of them at the commit.
     """
     results: list[Mapping[str, Any]] = []
     postgres = _requested(request, PostgresSource)
@@ -642,18 +696,46 @@ def _collect_source_systems(
         from graphify.pg_introspect import introspect_postgres
 
         try:
-            results.append(introspect_postgres(postgres.dsn))
+            result = introspect_postgres(postgres.dsn)
         except Exception as exc:
             raise _SourceUnavailable(f"PostgreSQL: {exc}") from exc
+        observe.emit(_collected_from_result(EvidenceOrigin.POSTGRES, result))
+        results.append(result)
     cargo = _requested(request, CargoSource)
     if cargo is not None:
         from graphify.cargo_introspect import introspect_cargo
 
         try:
-            results.append(introspect_cargo(corpus.root))
+            result = introspect_cargo(corpus.root)
         except Exception as exc:
             raise _SourceUnavailable(f"Cargo: {exc}") from exc
+        observe.emit(_collected_from_result(EvidenceOrigin.CARGO, result))
+        results.append(result)
     return _combined(*results)
+
+
+def _collected_from_result(origin: EvidenceOrigin, result: Mapping[str, Any]) -> EvidenceCollected:
+    """Return what one node/edge shaped extraction result contributed."""
+    return EvidenceCollected(
+        origin=origin,
+        nodes=len(result.get("nodes") or ()),
+        edges=len(result.get("edges") or ()),
+        hyperedges=len(result.get("hyperedges") or ()),
+    )
+
+
+def _collected_from_evidence(
+    origin: EvidenceOrigin,
+    evidence: Iterable[SourceEvidence],
+) -> EvidenceCollected:
+    """Return what a set of per-source contributions collectively contributed."""
+    gathered = list(evidence)
+    return EvidenceCollected(
+        origin=origin,
+        nodes=sum(len(item.nodes) for item in gathered),
+        edges=sum(len(item.edges) for item in gathered),
+        hyperedges=sum(len(item.hyperedges) for item in gathered),
+    )
 
 
 def _failed_google_workspace_exports(detection: Mapping[str, Any]) -> tuple[str, ...]:
@@ -778,6 +860,29 @@ def _retained_staleness(
     if contribution.source not in live:
         return contribution.stale
     return contribution.source in stale_semantic
+
+
+def _semantic_marker(
+    layout: _PublicationLayout,
+    interpreted: bool,
+) -> dict[str, Any] | None:
+    """Return the compatibility marker recording interpreted evidence, if new.
+
+    The marker says one thing to the tools that read it — this Corpus's graph
+    cost real interpretation, so protect it before replacing it — and that claim
+    does not change between runs. It is therefore written only when a run that
+    interpreted something finds it missing; rewriting it every time would report
+    a canonical artifact as changed on a run that changed nothing.
+
+    ``None`` when this run interpreted nothing, which leaves an existing marker
+    alone: Semantic evidence retained from an earlier generation is still
+    Semantic evidence, and a Code-update-shaped run has no standing to withdraw
+    the claim.
+    """
+    if not interpreted:
+        return None
+    path = layout.path_for(_CanonicalArtifact.SEMANTIC_MARKER)
+    return None if path.is_file() else {"interpreted": True}
 
 
 def _pending_marker(
