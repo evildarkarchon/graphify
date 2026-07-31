@@ -116,6 +116,7 @@ class CorpusGraph:
             changed_paths=request.changed_paths,
             authority=_RequestedAuthority(
                 force=request.force,
+                allow_partial_publication=request.allow_partial_publication,
                 policy_replacement=_policy_replacement(request.build_policy),
             ),
         )
@@ -354,12 +355,12 @@ def _full_extraction_for(
 ) -> FullExtractionRequest:
     """Return the Full extraction one coalesced unit asks this executor to run.
 
-    Hints, ``force``, and the requested Corpus policy come from the unit, so
-    authority another process asked for is honored rather than dropped. The
-    evidence sources come from this process's own request: they are live
-    adapters — an open provider, a DSN a caller resolved — that a durable record
-    could not carry, which is also why a Full extraction is never acknowledged as
-    merely queued.
+    Hints, ``force``, partial-publication authority, and the requested Corpus
+    policy come from the unit, so authority another process asked for is honored
+    rather than dropped. The evidence sources come from this process's own
+    request: they are live adapters — an open provider, a DSN a caller resolved —
+    that a durable record could not carry, which is also why a Full extraction is
+    never acknowledged as merely queued.
     """
     replacement = unit.authority.policy_replacement
     if replacement is None:
@@ -380,6 +381,7 @@ def _full_extraction_for(
         build_policy=build_policy,
         changed_paths=tuple(Path(hint) for hint in unit.changed_paths),
         force=unit.authority.force,
+        allow_partial_publication=unit.authority.allow_partial_publication,
     )
 
 

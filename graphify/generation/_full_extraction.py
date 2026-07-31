@@ -22,13 +22,19 @@ Two custody rules govern what a run is allowed to replace:
 
 Publishing the successful sources while failed ones stay stale and pending is
 what makes partial progress *possible*; whether it is **permitted** is a
-separate safety rule that gates this operation from outside it.
+separate authority the request must carry. Discovery that could not enumerate
+the whole Corpus, and interpretation the provider did not complete, both refuse
+to replace the active Graph generation unless
+``FullExtractionRequest.allow_partial_publication`` says otherwise. That
+authority changes nothing about what the run produced — only whether an
+unfinished run may publish it — and it is separate from ``force``, which
+authorizes a smaller graph and nothing else.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterable, Mapping, TypeVar
+from typing import Any, Iterable, Mapping, Sequence, TypeVar
 
 from graphify.generation._contributions import (
     _UNATTRIBUTED_LEGACY_SOURCE,
@@ -97,6 +103,10 @@ _GOOGLE_WORKSPACE_FAILURES = (
     "[Google Workspace export failed",
     "[Google Workspace export produced no readable text]",
 )
+
+# How many sources a refusal names before it counts the remainder. Enough to act
+# on, few enough that the reason stays one readable sentence.
+_NAMED_IN_REASON = 5
 
 
 class _SourceUnavailable(Exception):
@@ -167,18 +177,24 @@ def _plan_full_extraction(
         google_workspace=True if google_workspace else None,
         cache_root=output.parent,
     )
-    if detection.get("walk_errors"):
-        # Discovery could not enumerate the whole Corpus, so absence is not
-        # deletion evidence and the resulting generation would silently describe
-        # a subset.
-        return PublicationRefused(
-            "Corpus discovery was incomplete "
-            f"({len(detection['walk_errors'])} unreadable location(s)): "
-            "refusing to replace the active Graph generation"
-        )
+    walk_errors = detection.get("walk_errors") or ()
     failed_exports = (
         _failed_google_workspace_exports(detection) if google_workspace else ()
     )
+    # Discovery could not describe the whole Corpus: a location it could not
+    # enumerate, or a Google Workspace shortcut that produced no document. The
+    # resulting generation would silently describe a subset, so it is refused
+    # here — before an external provider is asked to interpret anything, since
+    # the answer would be thrown away with it.
+    if (walk_errors or failed_exports) and not request.allow_partial_publication:
+        return _incomplete_publication_refusal(
+            "Corpus discovery",
+            _discovery_detail(walk_errors, failed_exports),
+        )
+    # Absence is deletion evidence only when the scan that produced it saw
+    # everything. An authorized partial run may commit what it did see; it never
+    # gets to conclude that the part it could not see has left the Corpus.
+    deletion_is_authoritative = not walk_errors and not failed_exports
 
     graph_path = layout.path_for(_CanonicalArtifact.GRAPH)
     try:
@@ -205,6 +221,15 @@ def _plan_full_extraction(
         if provider is not None
         else frozenset()
     )
+    if uninterpreted and not request.allow_partial_publication:
+        # The provider was asked about these sources and did not report them as
+        # completely interpreted. Publishing anyway would present a generation
+        # missing interpretation it was asked for as though it were finished.
+        return _incomplete_publication_refusal(
+            "interpretation",
+            f"{len(uninterpreted)} of {len(semantic_corpus)} requested source(s) "
+            f"were not completely interpreted: {_named(sorted(uninterpreted))}",
+        )
 
     # A document this run is interpreting — or already carries evidence that
     # cannot be re-derived structurally — is represented by that interpretation.
@@ -293,7 +318,7 @@ def _plan_full_extraction(
     # state nor retire the legacy evidence a complete interpretation accounts for.
     complete = (
         not uninterpreted
-        and not failed_exports
+        and deletion_is_authoritative
         and (provider is not None or not semantic_corpus)
     )
 
@@ -304,12 +329,10 @@ def _plan_full_extraction(
             active,
             live=live,
             replaced=replaced,
+            uninterpreted=uninterpreted,
             covered=covered,
             stale_semantic=stale_semantic,
-            # A failed export makes absence ambiguous: a shortcut that could not
-            # be exported has no sidecar in this scan, and reconciling that as a
-            # deletion would destroy evidence the Corpus still owns.
-            deletion_is_authoritative=not failed_exports,
+            deletion_is_authoritative=deletion_is_authoritative,
             retire_unattributed_legacy=complete,
         )
     )
@@ -324,7 +347,7 @@ def _plan_full_extraction(
         contribution.source
         for contribution in active
         if contribution.source not in live
-        and not failed_exports
+        and deletion_is_authoritative
         # A source system is never absent from a filesystem scan, so its
         # evidence disappearing would be a loss this run cannot explain.
         and not _is_external_source_identity(contribution.source)
@@ -366,11 +389,13 @@ def _plan_full_extraction(
         ),
         needs_update=_pending_marker(
             layout,
-            # A shortcut that could not be exported is outstanding work too, but
-            # it has no ledger identity to disclose per source — the sidecar it
-            # would have produced does not exist — so it reaches the marker as
-            # unnamed outstanding work rather than as a named pending source.
-            pending=bool(pending) or bool(failed_exports),
+            # Incomplete discovery is outstanding work the ledger cannot express:
+            # a shortcut that could not be exported has no sidecar to name, and a
+            # location the scan could not enter may hide sources the Corpus has
+            # never recorded at all. The sources that *do* have ledger identities
+            # disclose their own state; the marker carries the rest, which by
+            # definition cannot be named per source.
+            pending=bool(pending) or not deletion_is_authoritative,
             complete=complete,
         ),
         # Publishing graph evidence publishes a Raw graph generation, so the
@@ -380,6 +405,45 @@ def _plan_full_extraction(
         retire=frozenset(retire),
         protect_previous=graph_changed,
     )
+
+
+def _incomplete_publication_refusal(stage: str, detail: str) -> PublicationRefused:
+    """Refuse to replace the active generation from work that did not finish.
+
+    ``stage`` names the half of the operation that fell short — discovery or
+    interpretation — and ``detail`` says how, because between them that is the
+    part a caller can act on: fix the cause, or authorize the partial result.
+    """
+    return PublicationRefused(
+        f"{stage} was incomplete ({detail}): refusing to replace the active Graph "
+        "generation without explicit partial-publication authority"
+    )
+
+
+def _discovery_detail(
+    walk_errors: Iterable[Any],
+    failed_exports: Iterable[str],
+) -> str:
+    """Describe how discovery fell short of enumerating the whole Corpus."""
+    parts = []
+    unreadable = list(walk_errors)
+    if unreadable:
+        parts.append(f"{len(unreadable)} unreadable location(s)")
+    unexported = list(failed_exports)
+    if unexported:
+        parts.append(
+            f"{len(unexported)} Google Workspace shortcut(s) that produced no "
+            "document"
+        )
+    return ", ".join(parts)
+
+
+def _named(sources: Sequence[str]) -> str:
+    """Name the sources involved, capping the list so a reason stays readable."""
+    named = ", ".join(sources[:_NAMED_IN_REASON])
+    if len(sources) <= _NAMED_IN_REASON:
+        return named
+    return f"{named} (+{len(sources) - _NAMED_IN_REASON} more)"
 
 
 def _resolve_build_policy(
@@ -607,6 +671,7 @@ def _preserved_contributions(
     *,
     live: set[str],
     replaced: set[tuple[str, _InterpretationKind]],
+    uninterpreted: frozenset[str],
     covered: set[str],
     stale_semantic: set[str],
     deletion_is_authoritative: bool,
@@ -622,6 +687,14 @@ def _preserved_contributions(
     whether this run had the authority to retire it: a source the authoritative
     scan proved has left the Corpus is dropped, and a source that is still live
     keeps the evidence this run could not reproduce.
+
+    Structural evidence normally never survives: this run re-derives it for every
+    source it owns, and a document its interpretation now represents must not keep
+    a second, older description of itself. The exception is the two failures this
+    operation may be authorized to publish through — a source discovery could not
+    reach, and one whose interpretation did not complete. Neither produced
+    anything to put in place of the prior contribution, so dropping it would turn
+    a failure into evidence loss.
 
     Retained Semantic evidence carries an explicit stale marking whenever the
     manifest this run publishes can no longer vouch for the interpretation, so
@@ -651,9 +724,18 @@ def _preserved_contributions(
         if deletion_is_authoritative and source not in live:
             continue
         if contribution.interpretation is _InterpretationKind.STRUCTURAL:
-            # Structural evidence for a source this run still owns was re-derived
-            # above; for one it no longer owns, keeping it would describe the
-            # Corpus as it used to be.
+            if source not in live or source in uninterpreted:
+                # Reaching here with a source that is not live means discovery
+                # could not enumerate everything, so this run never looked at it;
+                # a source in ``uninterpreted`` was looked at, but the
+                # interpretation that was going to represent it did not arrive.
+                # Either way this run produced nothing to put in its place, and
+                # dropping the last structural evidence would turn a failure into
+                # evidence loss.
+                preserved.append(_as_source_contribution(contribution))
+                continue
+            # Re-derived above, or now represented by this run's interpretation.
+            # Keeping this too would describe the source twice, once as it was.
             continue
         if contribution.provisional and source in covered:
             # Evidence adopted from a pre-ledger graph, for a source real
@@ -663,14 +745,39 @@ def _preserved_contributions(
         preserved.append(
             _as_source_contribution(
                 contribution,
-                stale=(
-                    source in stale_semantic
-                    if contribution.interpretation is _InterpretationKind.SEMANTIC
-                    else contribution.stale
+                stale=_retained_staleness(
+                    contribution,
+                    live=live,
+                    stale_semantic=stale_semantic,
                 ),
             )
         )
     return tuple(preserved)
+
+
+def _retained_staleness(
+    contribution: _PreparedContribution,
+    *,
+    live: set[str],
+    stale_semantic: set[str],
+) -> bool:
+    """Return the stale marking retained evidence should carry forward.
+
+    Semantic evidence for a live source is re-derived from the manifest this run
+    publishes, so the marking clears exactly when interpretation is current again
+    and never merely because a run completed.
+
+    A source this run could not see is the exception. ``stale_semantic`` is built
+    from live sources only, so treating absence from it as "not stale" would
+    withdraw a disclosure this run has no evidence to withdraw — the source was
+    outside a scan that could not enumerate everything, and whatever the last run
+    that *could* see it concluded still stands.
+    """
+    if contribution.interpretation is not _InterpretationKind.SEMANTIC:
+        return contribution.stale
+    if contribution.source not in live:
+        return contribution.stale
+    return contribution.source in stale_semantic
 
 
 def _pending_marker(

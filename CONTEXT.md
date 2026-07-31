@@ -50,6 +50,14 @@ _Avoid_: Result, Payload
 The recorded discovery shaping — extra exclusions, whether VCS ignore files are honored — that a graph generation was built under. Full extraction preserves it unless replacement or clearing is explicitly requested.
 _Avoid_: Config, Settings
 
+**Incomplete discovery**:
+A corpus scan that could not enumerate every source it was asked about, so absence is not evidence that a source left the corpus.
+_Avoid_: Partial scan
+
+**Partial-publication authority**:
+The requested authority that lets one full extraction commit after incomplete discovery or incomplete interpretation. The sources that completed are published; the rest keep their prior evidence or keep having none and remain pending. Code update never carries it, and it is separate from the authority to publish a smaller graph.
+_Avoid_: Force, Override
+
 **Graph generation**:
 The mutually consistent graph and corpus state published by one completed full extraction, code update, or reclustering.
 _Avoid_: Output files

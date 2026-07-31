@@ -88,9 +88,33 @@ interpreted every live semantic source may clear pending state.
 Full extraction preserves the active corpus build policy unless the request
 carries an explicit replacement or clearing.
 
+### Publishing incomplete work
+
+An operation that did not finish refuses to replace the active graph generation.
+Two things count as not finishing: corpus discovery that could not enumerate
+everything — an unreadable location, a Google Workspace shortcut that produced no
+document — and interpretation the semantic provider did not report as complete.
+Discovery is checked before the provider is asked anything, so a run that cannot
+publish does not pay for an interpretation first.
+
+`FullExtractionRequest.allow_partial_publication` is the authority to commit such
+a run anyway. It changes nothing about what the run produced: the sources that
+completed are published, the rest keep their prior evidence or keep having none,
+and the generation stays pending. It also never lets absence stand in for
+deletion — a source discovery could not reach is retained, not retired.
+
+The two authorities stay separate. `force` says the active graph may be replaced
+by a smaller one and says nothing about whether the run finished;
+`allow_partial_publication` says the reverse. Neither implies the other, and code
+update carries only `force` — it is the cheap deterministic path, so it must not
+also be the one that can publish a partial result. The durable request queue
+enforces that: a code update claiming partial-publication authority is rejected
+before it is recorded.
+
 The `graphify extract` CLI is still an unrerouted adapter: it prepares a
-candidate and hands it over privately. Rerouting it is issue #12, and refusing an
-incomplete extraction by default is issue #11.
+candidate and hands it over privately, so its own `--allow-partial` flag still
+maps to the legacy shrink override rather than to this authority. Rerouting it is
+issue #12.
 
 ## Extraction output schema
 

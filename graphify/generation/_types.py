@@ -172,12 +172,21 @@ class FullExtractionRequest:
     explicitly. ``changed_paths`` is an optimization hint only — authoritative
     discovery decides which sources are live — and ``force`` authorizes replacing
     the active graph with a smaller one without weakening any other rule.
+
+    ``allow_partial_publication`` is the separate authority to commit a run that
+    did not finish: incomplete Corpus discovery or an interpretation the provider
+    could not complete otherwise refuses to replace the active Graph generation.
+    Authorizing it publishes the sources that did complete and leaves the rest
+    stale or absent and pending — it never invents evidence, and it never
+    authorizes anything ``force`` covers. Full extraction is the only operation
+    that may carry it; Code update stays fail closed.
     """
 
     sources: tuple[EvidenceSource, ...] = ()
     build_policy: BuildPolicyRequest | None = None
     changed_paths: tuple[Path, ...] = ()
     force: bool = False
+    allow_partial_publication: bool = False
 
 
 @dataclass(frozen=True)
