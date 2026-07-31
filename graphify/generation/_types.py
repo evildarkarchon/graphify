@@ -73,7 +73,14 @@ class AlreadyCurrent:
 
 @dataclass(frozen=True)
 class Queued:
-    """A background request was durably accepted for later execution."""
+    """A background request was durably accepted for later execution.
+
+    ``request_id`` identifies the durable record the acknowledgment refers to, so
+    an integrating caller can correlate a queued submission with the executor
+    that eventually covers it without reading printed output.
+    """
+
+    request_id: str
 
 
 @dataclass(frozen=True)

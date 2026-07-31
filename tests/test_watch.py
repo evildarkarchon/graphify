@@ -7,7 +7,15 @@ import time
 from pathlib import Path
 import pytest
 
-from graphify.watch import _notify_only, _WATCHED_EXTENSIONS, _rebuild_lock, _check_shrink
+from graphify.watch import _notify_only, _WATCHED_EXTENSIONS, _check_shrink
+
+
+def _request_coordinator(out: Path):
+    """Return the production request coordinator for a rebuild's output dir."""
+    from graphify.generation import Corpus
+    from graphify.generation._coordination import _RequestCoordinator
+
+    return _RequestCoordinator(Corpus(root=out.parent, output=out))
 
 
 # --- _notify_only ---
@@ -102,43 +110,10 @@ def test_watch_raises_without_watchdog(tmp_path, monkeypatch):
         watch(tmp_path)
 
 
-# --- _rebuild_lock (GH-858) ---
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="fcntl-only (POSIX)")
-def test_rebuild_lock_writes_pid_with_newline(tmp_path):
-    out = tmp_path / "graphify-out"
-    lock_path = out / ".rebuild.lock"
-    with _rebuild_lock(out) as got:
-        assert got is True
-        assert lock_path.exists()
-        contents = lock_path.read_text(encoding="utf-8")
-        assert contents == f"{os.getpid()}\n", contents
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="fcntl-only (POSIX)")
-def test_rebuild_lock_removed_after_release(tmp_path):
-    """GH-858: lock file must be unlinked once the rebuild completes so
-    downstream waiters that poll for its absence unblock promptly."""
-    out = tmp_path / "graphify-out"
-    lock_path = out / ".rebuild.lock"
-    with _rebuild_lock(out) as got:
-        assert got is True
-    assert not lock_path.exists(), "lock file should be unlinked after release"
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="fcntl-only (POSIX)")
-def test_rebuild_lock_does_not_accumulate_pids_across_runs(tmp_path):
-    """GH-858: each acquisition truncates and rewrites the PID line rather
-    than appending, so the file never grows into a digit-concatenation."""
-    out = tmp_path / "graphify-out"
-    lock_path = out / ".rebuild.lock"
-    expected = f"{os.getpid()}\n"
-    for _ in range(5):
-        with _rebuild_lock(out) as got:
-            assert got is True
-            assert lock_path.read_text(encoding="utf-8") == expected
-        assert not lock_path.exists()
+# The per-repo ``.rebuild.lock`` advisory flock these tests used to cover was
+# retired for the cross-platform ``CorpusGraph`` executor lease (#7); its holder
+# identity, release, and non-clobbering contention are covered by
+# tests/test_generation_coordination.py against real competing subprocesses.
 
 
 def test_graphify_root_preserves_relative_when_invoked_with_relative_path(tmp_path, monkeypatch):
@@ -448,8 +423,8 @@ def test_graphify_root_preserves_absolute_when_user_supplied(tmp_path):
 def test_rebuild_code_deleted_cwd_without_repo_root_returns_false(tmp_path, monkeypatch, capsys):
     """Detached hooks can inherit a CWD that no longer exists.
 
-    Without GRAPHIFY_REPO_ROOT, the rebuild should fail cleanly before creating
-    relative graphify-out queue/lock files.
+    Without GRAPHIFY_REPO_ROOT, the rebuild should fail cleanly before accepting
+    a request or taking a lease under a relative graphify-out.
     """
     from graphify.watch import _rebuild_code
 
@@ -931,21 +906,6 @@ def test_rebuild_code_preupgrade_marker_less_node_one_cycle_lag(tmp_path):
         "update (self-heal)"
     )
     assert "bar()" in labels(healed), "surviving symbol must be kept throughout"
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="fcntl-only (POSIX)")
-def test_rebuild_lock_non_blocking_does_not_clobber_holder(tmp_path):
-    """GH-858: a non-blocking caller that fails to acquire the lock must not
-    truncate the holder's PID payload."""
-    out = tmp_path / "graphify-out"
-    lock_path = out / ".rebuild.lock"
-    with _rebuild_lock(out) as outer:
-        assert outer is True
-        held_contents = lock_path.read_text(encoding="utf-8")
-        with _rebuild_lock(out, blocking=False) as inner:
-            assert inner is False
-            # Holder's PID line must still be intact.
-            assert lock_path.read_text(encoding="utf-8") == held_contents
 
 
 def test_rebuild_code_is_idempotent_when_cluster_ids_flap(tmp_path, monkeypatch):
@@ -1537,102 +1497,86 @@ def test_rebuild_code_incremental_rename_preserves_symlink_source_path(tmp_path)
     assert "linked/second.py" in sources
 
 
-# --- #1059: pending-changes queue prevents commit drops under lock contention ---
+# --- #1059: the durable request queue prevents commit drops under contention ---
 
 
-def test_queue_and_drain_pending_round_trip(tmp_path):
-    """_queue_pending writes one path per line; _drain_pending reads + unlinks
-    and returns the same set of paths."""
-    from graphify.watch import _queue_pending, _drain_pending, _PENDING_FILENAME
-
-    out = tmp_path / "graphify-out"
-    paths = [Path("a.py"), Path("sub/b.py"), Path("c.md")]
-    _queue_pending(out, paths)
-
-    pending_file = out / _PENDING_FILENAME
-    assert pending_file.exists()
-    # Each path written on its own line.
-    assert pending_file.read_text(encoding="utf-8").splitlines() == [
-        "a.py", "sub/b.py", "c.md",
-    ]
-
-    drained = _drain_pending(out)
-    assert drained == paths
-    # Drain unlinks so subsequent callers see an empty queue.
-    assert not pending_file.exists()
-    assert _drain_pending(out) == []
-
-
-def test_drain_pending_dedupes_and_skips_blank_lines(tmp_path):
-    """Repeated appends across concurrent contenders must dedupe; partial
-    writes leaving blank lines must not poison the merge."""
-    from graphify.watch import _queue_pending, _drain_pending
-
-    out = tmp_path / "graphify-out"
-    _queue_pending(out, [Path("a.py"), Path("b.py")])
-    _queue_pending(out, [Path("b.py"), Path("c.py")])
-    # Simulate a torn write leaving an empty line.
-    with open(out / ".pending_changes", "a", encoding="utf-8") as fh:
-        fh.write("\n   \n")
-
-    drained = _drain_pending(out)
-    assert drained == [Path("a.py"), Path("b.py"), Path("c.py")]
-
-
-def test_queue_pending_noop_on_empty_list(tmp_path):
-    """Empty change set must not create an empty .pending_changes file."""
-    from graphify.watch import _queue_pending, _PENDING_FILENAME
-
-    out = tmp_path / "graphify-out"
-    _queue_pending(out, [])
-    assert not (out / _PENDING_FILENAME).exists()
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="fcntl-only (POSIX)")
-def test_rebuild_code_queues_on_lock_contention(tmp_path, monkeypatch, capsys):
-    """#1059: when the rebuild lock is held, an incremental hook must queue
-    its changed_paths to .pending_changes and print 'queued' instead of
-    silently dropping the change set."""
-    from graphify.watch import _rebuild_code, _rebuild_lock, _PENDING_FILENAME
+def test_rebuild_code_accepts_a_durable_request_under_lease_contention(
+    tmp_path,
+    capsys,
+):
+    """#1059: a hook that loses the executor lease must still have its change
+    set durably accepted, and say 'queued' rather than dropping it."""
+    from graphify.watch import _rebuild_code
 
     out = tmp_path / "graphify-out"
     out.mkdir()
+    # Hold the lease from a real second process: the lease is deliberately
+    # reentrant within one process, so only another process can contend.
+    holder = tmp_path / "hold.py"
+    holder.write_text(
+        """
+import sys
+import time
+from pathlib import Path
 
-    # Hold the lock so the next non-blocking attempt fails. Use a real
-    # _rebuild_lock context manager in this same process — flock on the same
-    # file descriptor would otherwise be re-entrant on Linux, so we open
-    # the file ourselves via the lock helper.
-    with _rebuild_lock(out, blocking=False) as outer_got:
-        assert outer_got is True
+from graphify.generation import Corpus
+from graphify.generation._coordination import _LeaseOutcome, _RequestCoordinator
 
-        ok = _rebuild_code(
-            tmp_path,
-            changed_paths=[Path("a.py"), Path("b.py")],
-        )
+output, ready, stop = (Path(argument) for argument in sys.argv[1:4])
+coordinator = _RequestCoordinator(Corpus(root=output.parent, output=output))
+with coordinator.executor_lease() as lease:
+    assert lease is _LeaseOutcome.HELD, lease
+    ready.write_text("held\\n", encoding="utf-8")
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline and not stop.exists():
+        time.sleep(0.05)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    ready, stop = tmp_path / "ready", tmp_path / "stop"
+    env = os.environ.copy()
+    repository = Path(__file__).parents[1]
+    env["PYTHONPATH"] = str(repository) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(holder), str(out), str(ready), str(stop)],
+        cwd=str(tmp_path),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.05)
+        assert ready.exists(), "the holder process never took the lease"
+
+        ok = _rebuild_code(tmp_path, changed_paths=[Path("a.py"), Path("b.py")])
+
         assert ok is False
-
-        # Output should say "queued", not "skipping".
         captured = capsys.readouterr().out
         assert "queued" in captured.lower()
         assert "skipping" not in captured.lower()
+        # The paths are durably accepted so the eventual executor covers them.
+        pending = _request_coordinator(out).pending()
+        assert [request.changed_paths for request in pending] == [("a.py", "b.py")]
+    finally:
+        stop.write_text("stop\n", encoding="utf-8")
+        process.communicate(timeout=180)
 
-        # And the paths must have been written to the pending file so the
-        # eventual lock-holder can drain them.
-        pending = out / _PENDING_FILENAME
-        assert pending.exists()
-        assert pending.read_text(encoding="utf-8").splitlines() == ["a.py", "b.py"]
 
-
-@pytest.mark.skipif(sys.platform == "win32", reason="fcntl-only (POSIX)")
-def test_rebuild_code_merges_pending_on_acquire(tmp_path, monkeypatch):
-    """#1059: the process that acquires the lock must drain .pending_changes
-    and pass the merged change set to the inner rebuild call."""
+def test_rebuild_code_merges_accepted_requests_on_acquire(tmp_path, monkeypatch):
+    """#1059: the process that takes the lease must merge the path hints of
+    every accepted request into the inner rebuild call, then cover them."""
     from graphify import watch as watch_mod
 
     out = tmp_path / "graphify-out"
     out.mkdir()
-    # Pre-populate the queue as if an earlier contender had dropped its paths.
-    watch_mod._queue_pending(out, [Path("queued1.py"), Path("queued2.py")])
+    # Pre-populate the queue as if an earlier contender had lost the lease.
+    coordinator = _request_coordinator(out)
+    coordinator.accept("code-update", changed_paths=["queued1.py", "queued2.py"])
 
     # Snapshot the original BEFORE monkeypatching so we can drive the outer
     # dispatch path while the inner recursive call resolves to our spy.
@@ -1654,24 +1598,23 @@ def test_rebuild_code_merges_pending_on_acquire(tmp_path, monkeypatch):
     assert ok is True
 
     # The first inner call must have received the merged + deduped set:
-    # own.py first (caller's order preserved), then drained queued1/queued2,
+    # own.py first (caller's order preserved), then the accepted queued1/queued2,
     # with queued1.py deduped against own's prior occurrence.
     assert inner_calls, "inner _rebuild_code should have been called"
     assert inner_calls[0] == ["own.py", "queued1.py", "queued2.py"]
+    # And every request the rebuild covered is retired.
+    assert coordinator.pending() == ()
 
-    # And .pending_changes was drained.
-    assert not (out / watch_mod._PENDING_FILENAME).exists()
 
-
-@pytest.mark.skipif(sys.platform == "win32", reason="fcntl-only (POSIX)")
-def test_rebuild_code_drains_late_arrivals(tmp_path, monkeypatch):
-    """#1059: after the primary rebuild, the lock-holder must loop and drain
-    any paths queued by hooks that arrived mid-rebuild."""
+def test_rebuild_code_covers_late_arrivals(tmp_path, monkeypatch):
+    """#1059: after the primary rebuild, the lease holder must loop and cover
+    requests accepted by hooks that arrived mid-rebuild."""
     from graphify import watch as watch_mod
     from graphify.watch import _rebuild_code as orig_rebuild
 
     out = tmp_path / "graphify-out"
     out.mkdir()
+    coordinator = _request_coordinator(out)
 
     inner_calls: list[list[str]] = []
     call_state = {"i": 0}
@@ -1680,11 +1623,11 @@ def test_rebuild_code_drains_late_arrivals(tmp_path, monkeypatch):
         if kwargs.get("acquire_lock") is False:
             paths = [p.as_posix() for p in (kwargs.get("changed_paths") or [])]
             inner_calls.append(paths)
-            # Simulate a late-arriving hook that queues during the FIRST
-            # inner rebuild only. The outer drain loop must see it.
+            # Simulate a late-arriving hook accepted during the FIRST inner
+            # rebuild only. The outer loop must cover it.
             call_state["i"] += 1
             if call_state["i"] == 1:
-                watch_mod._queue_pending(out, [Path("late.py")])
+                coordinator.accept("code-update", changed_paths=["late.py"])
         return True
 
     monkeypatch.setattr(watch_mod, "_rebuild_code", fake_inner)
@@ -1692,27 +1635,26 @@ def test_rebuild_code_drains_late_arrivals(tmp_path, monkeypatch):
     ok = orig_rebuild(tmp_path, changed_paths=[Path("own.py")])
     assert ok is True
 
-    # First inner call covers our own change set; second is the late-drain
-    # pass that picks up "late.py".
+    # First inner call covers our own change set; second is the late pass that
+    # picks up "late.py".
     assert len(inner_calls) >= 2
     assert inner_calls[0] == ["own.py"]
     assert inner_calls[1] == ["late.py"]
-    # And the queue is now empty (no further late drains).
-    assert not (out / watch_mod._PENDING_FILENAME).exists()
+    assert coordinator.pending() == ()
 
 
-def test_rebuild_code_full_corpus_skips_pending_queue(tmp_path, monkeypatch):
-    """#1059: changed_paths=None means a full-corpus rebuild — the queue
-    must not be touched on the failure path because there is nothing
-    incremental to preserve."""
+def test_rebuild_code_full_corpus_supersedes_accepted_requests(tmp_path, monkeypatch):
+    """#1059: changed_paths=None means a full-corpus rebuild — it covers every
+    accepted request without narrowing itself to their path hints."""
     from graphify import watch as watch_mod
     from graphify.watch import _rebuild_code as orig_rebuild
 
     out = tmp_path / "graphify-out"
     out.mkdir()
 
-    # Pre-existing queued paths from an earlier incremental hook.
-    watch_mod._queue_pending(out, [Path("earlier.py")])
+    # A pre-existing accepted request from an earlier incremental hook.
+    coordinator = _request_coordinator(out)
+    coordinator.accept("code-update", changed_paths=["earlier.py"])
 
     # Force the inner call to record what it saw.
     seen: list = []
@@ -1726,12 +1668,29 @@ def test_rebuild_code_full_corpus_skips_pending_queue(tmp_path, monkeypatch):
 
     ok = orig_rebuild(tmp_path, changed_paths=None)
     assert ok is True
-    # Full-corpus rebuild passes None to the inner call (does not merge in
-    # the queued paths — a full rebuild already covers them).
+    # Full-corpus rebuild passes None to the inner call (it does not merge in
+    # the accepted path hints — a full rebuild already covers them).
     assert seen == [None]
-    # The queue still gets drained on entry so stale entries don't leak,
-    # but no late-arrival loop runs for the full-corpus path.
-    assert not (out / watch_mod._PENDING_FILENAME).exists()
+    # Covering them is still the full rebuild's job, so nothing is left queued.
+    assert coordinator.pending() == ()
+
+
+def test_rebuild_code_accepted_request_survives_a_failed_rebuild(tmp_path, monkeypatch):
+    """A rebuild that fails covered nothing, so its request stays accepted."""
+    from graphify import watch as watch_mod
+    from graphify.watch import _rebuild_code as orig_rebuild
+
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    coordinator = _request_coordinator(out)
+
+    def failing_inner(watch_path, **kwargs):
+        return False
+
+    monkeypatch.setattr(watch_mod, "_rebuild_code", failing_inner)
+
+    assert orig_rebuild(tmp_path, changed_paths=[Path("own.py")]) is False
+    assert [request.changed_paths for request in coordinator.pending()] == [("own.py",)]
 
 
 def test_merge_changed_paths_dedupes_in_order():

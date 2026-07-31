@@ -193,36 +193,61 @@ CorpusGraph(Corpus(root=root, output=output)).code_update(
     assert _coordinator(tmp_path, output).pending() == ()
 
 
-def test_a_prepared_publication_cannot_be_durably_queued(tmp_path) -> None:
-    """Refuse to acknowledge in-memory work as durably accepted."""
+def test_an_operation_without_an_executor_cannot_be_durably_queued(tmp_path) -> None:
+    """Refuse to acknowledge work no executor could ever carry out.
+
+    A prepared candidate lives in the calling process's memory, and Full
+    extraction and Reclustering are still adapter-prepared rather than executed
+    by this module. Recording either durably would produce a queued
+    acknowledgment nothing on the Corpus is able to cover.
+    """
     from graphify.generation import (
         Corpus,
         CorpusGraph,
         FullExtractionRequest,
+        ReclusteringRequest,
         ReturnWhenQueued,
     )
     from graphify.generation._publication import _Publication
 
     output = tmp_path / "graphify-out"
+    owner = CorpusGraph(Corpus(root=tmp_path, output=output))
 
     with pytest.raises(ValueError):
-        CorpusGraph(Corpus(root=tmp_path, output=output)).full_extraction(
+        owner.full_extraction(
             FullExtractionRequest(),
             completion=ReturnWhenQueued(),
             _publication=_Publication(build_config={"generation": "prepared"}),
         )
+    with pytest.raises(ValueError):
+        owner.full_extraction(
+            FullExtractionRequest(),
+            completion=ReturnWhenQueued(),
+        )
+    with pytest.raises(ValueError):
+        owner.reclustering(
+            ReclusteringRequest(),
+            completion=ReturnWhenQueued(),
+        )
 
+    # Refused before anything was written, so no record is left to be covered.
     assert not (output / ".graphify_requests").exists()
 
 
-def test_full_extraction_covers_queued_code_update_work(tmp_path) -> None:
-    """Retire ordinary update work a completed Full extraction already covers."""
+def test_a_prepared_publication_covers_no_queued_work(tmp_path) -> None:
+    """Never retire work on behalf of a candidate prepared before the request.
+
+    A compatibility adapter builds its candidate before handing it over, so the
+    owning module cannot know which moment of the Corpus that candidate
+    describes. Covering a queued request from it would retire work nobody did.
+    """
     from graphify.generation import (
         CodeUpdateRequest,
         Corpus,
         CorpusGraph,
         FullExtractionRequest,
         GenerationPublished,
+        Queued,
         ReturnWhenQueued,
     )
     from graphify.generation._contributions import (
@@ -232,14 +257,14 @@ def test_full_extraction_covers_queued_code_update_work(tmp_path) -> None:
     from graphify.generation._publication import _Publication
 
     output = tmp_path / "graphify-out"
-    source = tmp_path / "covered.py"
-    source.write_text("COVERED = True\n", encoding="utf-8")
+    source = tmp_path / "prepared.py"
+    source.write_text("PREPARED = True\n", encoding="utf-8")
     owner = CorpusGraph(Corpus(root=tmp_path, output=output))
-    owner.code_update(
-        CodeUpdateRequest((Path("covered.py"),)),
+    queued = owner.code_update(
+        CodeUpdateRequest((Path("later.py"),)),
         completion=ReturnWhenQueued(),
     )
-    assert _coordinator(tmp_path, output).pending()
+    assert isinstance(queued, Queued)
 
     outcome = owner.full_extraction(
         FullExtractionRequest(),
@@ -250,8 +275,8 @@ def test_full_extraction_covers_queued_code_update_work(tmp_path) -> None:
                     interpretation=_InterpretationKind.STRUCTURAL,
                     nodes=(
                         {
-                            "id": "covered",
-                            "label": "Covered",
+                            "id": "prepared",
+                            "label": "Prepared",
                             "source_file": str(source),
                             "file_type": "code",
                         },
@@ -263,7 +288,66 @@ def test_full_extraction_covers_queued_code_update_work(tmp_path) -> None:
     )
 
     assert isinstance(outcome, GenerationPublished)
-    assert _coordinator(tmp_path, output).pending() == ()
+    pending = _coordinator(tmp_path, output).pending()
+    assert [request.request_id for request in pending] == [queued.request_id]
+
+
+def test_a_request_accepted_mid_execution_is_covered_by_an_extra_pass(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Cover a request that arrives mid-run with work that could have seen it.
+
+    A hook that commits while this executor is scanning cannot be covered by the
+    generation whose discovery already happened, so the executor makes another
+    pass for it rather than either retiring it unearned or leaving it queued.
+    """
+    from graphify import detect as detect_module
+    from graphify.generation import (
+        CodeUpdateRequest,
+        Corpus,
+        CorpusGraph,
+        GenerationPublished,
+    )
+    from graphify.generation._coordination import _AcceptedRequest
+
+    output = tmp_path / "graphify-out"
+    (tmp_path / "first.py").write_text(
+        "class First:\n    def run(self):\n        return 1\n",
+        encoding="utf-8",
+    )
+    coordinator = _coordinator(tmp_path, output)
+    accepted_before = coordinator.accept("code-update", changed_paths=("first.py",))
+    real_detect = detect_module.detect
+    discoveries: list[None] = []
+    late: list[_AcceptedRequest] = []
+
+    def accept_a_late_request(*args, **kwargs):
+        discoveries.append(None)
+        if len(discoveries) == 1:
+            # Stands in for a second hook accepted while this scan is running.
+            (tmp_path / "second.py").write_text(
+                "class Second:\n    def run(self):\n        return 1\n",
+                encoding="utf-8",
+            )
+            late.append(
+                coordinator.accept("code-update", changed_paths=("second.py",))
+            )
+        return real_detect(*args, **kwargs)
+
+    monkeypatch.setattr(detect_module, "detect", accept_a_late_request)
+
+    outcome = CorpusGraph(Corpus(root=tmp_path, output=output)).code_update(
+        CodeUpdateRequest()
+    )
+
+    assert isinstance(outcome, GenerationPublished)
+    # A second discovery ran: the first one predated the late request entirely.
+    assert len(discoveries) >= 2
+    assert coordinator.is_covered(accepted_before)
+    assert coordinator.is_covered(late[0])
+    assert coordinator.pending() == ()
+    assert _graph_labels(output) >= {"First", "Second"}
 
 
 # --- one executor lease -------------------------------------------------------

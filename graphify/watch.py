@@ -1,6 +1,5 @@
 # monitor a folder and auto-trigger --update when files change
 from __future__ import annotations
-import contextlib
 import json
 import os
 import posixpath
@@ -8,65 +7,13 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Sequence
 
 # Single source of truth in graphify.paths (#1423); re-exported as _GRAPHIFY_OUT.
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
-_PENDING_FILENAME = ".pending_changes"
-_PENDING_DRAIN_MAX_PASSES = 20
 
-
-def _queue_pending(out_dir: Path, changed_paths: list[Path]) -> None:
-    """Append ``changed_paths`` to ``out_dir/.pending_changes`` (one per line).
-
-    Used by a post-commit hook process that cannot acquire ``_rebuild_lock``
-    so its change set is not silently dropped (#1059). The lock-holding
-    process drains this file before and after its rebuild and merges the
-    contents with its own change set.
-
-    Opened in append mode so concurrent writers do not clobber each other on
-    POSIX; each ``write()`` of a small payload is effectively atomic. A
-    trailing newline is always written so partial-line corruption stays
-    confined to the offending entry and is skipped on drain.
-    """
-    if not changed_paths:
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-    pending = out_dir / _PENDING_FILENAME
-    payload = "".join(f"{os.fspath(p)}\n" for p in changed_paths)
-    with open(pending, "a", encoding="utf-8") as fh:
-        fh.write(payload)
-
-
-def _drain_pending(out_dir: Path) -> list[Path]:
-    """Read + unlink ``out_dir/.pending_changes`` and return deduplicated paths.
-
-    Returns an empty list if the file does not exist. Empty/whitespace lines
-    are silently skipped so a partial concurrent write that left only a
-    fragment cannot poison the merge.
-    """
-    pending = out_dir / _PENDING_FILENAME
-    if not pending.exists():
-        return []
-    try:
-        raw = pending.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    # Unlink BEFORE returning so a crash between read and process retains the
-    # data in the next caller's view via the lines we are about to return —
-    # i.e. losing the file after reading is fine, losing it before would be a
-    # bug. Use missing_ok to tolerate a racing drain on platforms where
-    # rename/unlink may interleave.
-    with contextlib.suppress(FileNotFoundError):
-        pending.unlink()
-    seen: set[str] = set()
-    out: list[Path] = []
-    for line in raw.splitlines():
-        s = line.strip()
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        out.append(Path(s))
-    return out
+if TYPE_CHECKING:  # imported for annotations only; the runtime import is lazy
+    from graphify.generation._coordination import _AcceptedRequest
 
 
 # Build options that must survive into later rebuilds. The initial `extract`
@@ -147,9 +94,9 @@ def _read_build_gitignore(out_dir: Path) -> bool:
 def _merge_changed_paths(*sources: "list[Path] | None") -> list[Path]:
     """Concatenate path lists, preserving order and dropping duplicates.
 
-    Used to combine a hook process's own ``changed_paths`` with the drained
-    contents of ``.pending_changes`` so the lock-holding rebuild covers
-    every queued commit's worth of files (#1059).
+    Used to combine a hook process's own ``changed_paths`` with the path hints of
+    the requests other processes durably accepted, so the rebuild that owns the
+    executor lease covers every queued commit's worth of files (#1059).
     """
     seen: set[str] = set()
     out: list[Path] = []
@@ -165,64 +112,32 @@ def _merge_changed_paths(*sources: "list[Path] | None") -> list[Path]:
     return out
 
 
-@contextlib.contextmanager
-def _rebuild_lock(out_dir: Path, *, blocking: bool = False):
-    """Per-repo advisory lock around a rebuild.
+def _merged_change_set(
+    changed_paths: "list[Path] | None",
+    accepted: "Sequence[_AcceptedRequest]",
+    own: "_AcceptedRequest | None",
+) -> "list[Path] | None":
+    """Return the change set one rebuild must cover, or None for a full rebuild.
 
-    Yields True if acquired, False if another rebuild is already running and
-    ``blocking`` is False. Uses fcntl.flock so the lock is released
-    automatically if the process is killed (no stale-lock cleanup needed).
-
-    While the lock is held, ``.rebuild.lock`` contains the owning PID followed
-    by a newline so external pollers (publish scripts, etc.) can read it.
-    On successful release the file is unlinked so downstream tooling that
-    waits for the lock to clear by polling for its absence unblocks promptly.
-
-    Falls back to a no-op yield(True) on platforms without fcntl (Windows).
+    ``accepted`` is the durable requests this rebuild is about to cover and
+    ``own`` is this process's own record, whose hints are already in
+    ``changed_paths``. A queued request that carries no path hints asked for a
+    full-corpus rebuild, so it widens the merged set to everything rather than
+    being merged in as zero files — the ``.pending_changes`` file this replaces
+    could not express that distinction at all.
     """
-    try:
-        import fcntl
-    except ImportError:
-        yield True
-        return
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = out_dir / ".rebuild.lock"
-    # "a+" creates the file if missing without truncating an existing holder's
-    # PID payload — important because another process may have already written
-    # its PID before we attempt the flock.
-    fh = open(lock_path, "a+", encoding="utf-8")
-    acquired = False
-    try:
-        flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
-            fcntl.flock(fh.fileno(), flags)
-        except BlockingIOError:
-            yield False
-            return
-        acquired = True
-        # Replace any prior owner's PID with ours so external readers see a
-        # single parseable line, not a digit-concatenation across rebuilds.
-        try:
-            fh.seek(0)
-            fh.truncate()
-            fh.write(f"{os.getpid()}\n")
-            fh.flush()
-        except OSError:
-            pass
-        yield True
-    finally:
-        if acquired:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-        fh.close()
-        # Signal "rebuild done" by removing the lock file. Only the holder
-        # unlinks; a non-acquiring caller leaves the existing lock in place.
-        if acquired:
-            with contextlib.suppress(OSError):
-                lock_path.unlink()
+    if changed_paths is None:
+        # Our own full-corpus rebuild already supersedes queued incremental work.
+        return None
+    others = [
+        request
+        for request in accepted
+        if own is None or request.request_id != own.request_id
+    ]
+    if any(not request.changed_paths for request in others):
+        return None
+    hints = [Path(hint) for request in others for hint in request.changed_paths]
+    return _merge_changed_paths(changed_paths, hints)
 
 
 def _apply_resource_limits() -> None:
@@ -891,45 +806,55 @@ def _rebuild_code(
     the preserved set. When ``changed_paths`` is None the full code corpus is
     re-extracted (used by the watcher and post-checkout hook).
 
-    ``acquire_lock`` (default True) takes a non-blocking per-repo flock around
-    the rebuild so concurrent post-commit hooks across multiple repos do not
-    pile up. Returns False with a log line if the lock is held. Pass
-    ``block_on_lock=True`` to wait instead of skip (used by the interactive
-    ``graphify update`` CLI).
+    ``acquire_lock`` (default True) durably accepts this rebuild as a Code-update
+    request and then takes the one ``CorpusGraph`` executor lease for the Corpus,
+    so concurrent post-commit hooks across multiple repos do not pile up.
+    Returns False with a log line when another process owns the lease — the
+    request stays durably accepted, so the executor that does own it covers this
+    change set rather than dropping it. Pass ``block_on_lock=True`` to wait
+    instead of skip (used by the interactive ``graphify update`` CLI).
 
     ``no_cluster`` skips community detection and writes raw merged extraction
     JSON to graphify-out/graph.json (mirrors ``extract --no-cluster``).
 
-    Returns True on success, False on error or skipped-due-to-lock.
+    Returns True on success, False on error or skipped-due-to-lease.
     """
     if not _stabilize_rebuild_cwd(watch_path):
         return False
 
     out = watch_path / _GRAPHIFY_OUT
     if acquire_lock:
-        # #1059: incremental (changed_paths is not None) hooks must not drop
-        # their change set when another rebuild is already running. Queue
-        # before attempting the lock so a non-blocking failure still records
-        # the work; the lock-holder drains the queue and merges it in. Full-
-        # corpus rebuilds skip the queue entirely — they already cover every
-        # file, so there is nothing to merge.
-        if changed_paths is not None and not block_on_lock:
-            _queue_pending(out, list(changed_paths))
-        with _rebuild_lock(out, blocking=block_on_lock) as got:
-            if not got:
+        from graphify.generation import Corpus
+        from graphify.generation._coordination import (
+            _LATE_ARRIVAL_PASSES,
+            _LeaseOutcome,
+            _RequestCoordinator,
+        )
+
+        coordinator = _RequestCoordinator(
+            Corpus(root=watch_path.resolve(), output=out)
+        )
+        code_update_only = coordinator.subsumed_by("code-update")
+        # #1059: accept the request durably BEFORE contending for the lease, so a
+        # hook that loses the race still recorded its change set. Unlike the
+        # ``.pending_changes`` file this replaces, a full-corpus rebuild is
+        # accepted too — losing the lease used to drop it entirely.
+        accepted = coordinator.accept(
+            "code-update",
+            changed_paths=changed_paths or (),
+        )
+        with coordinator.executor_lease(
+            timeout=None if block_on_lock else 0.0,
+        ) as lease:
+            if lease is not _LeaseOutcome.HELD:
                 print("[graphify watch] Rebuild already in progress for "
                       f"{watch_path.resolve()} - changes queued.")
                 return False
-            # Lock acquired. Drain anything queued by earlier contenders
-            # (including, importantly, the paths we just queued ourselves)
-            # and merge with our own change set so a single rebuild covers
-            # everything outstanding.
-            if changed_paths is not None:
-                merged = _merge_changed_paths(changed_paths, _drain_pending(out))
-            else:
-                # Full-corpus rebuild supersedes any queued incremental work.
-                _drain_pending(out)
-                merged = None
+            # Lease acquired. Cover every request accepted before this rebuild
+            # started, merging the other processes' path hints into our own
+            # change set so one rebuild covers everything outstanding.
+            covered = coordinator.pending(operations=code_update_only)
+            merged = _merged_change_set(changed_paths, covered, accepted)
             ok = _rebuild_code(
                 watch_path,
                 changed_paths=merged,
@@ -938,23 +863,30 @@ def _rebuild_code(
                 no_cluster=no_cluster,
                 acquire_lock=False,
             )
-            # Late-arrival drain: another hook may have queued work while we
-            # were rebuilding. Loop up to _PENDING_DRAIN_MAX_PASSES times so a
-            # storm of commits eventually quiesces without livelocking. A full
-            # rebuild already saw everything, so skip this for changed_paths is None.
+            if not ok:
+                # A failed rebuild covered nothing, so the accepted requests stay
+                # on disk for whichever executor manages to cover them next.
+                return False
+            coordinator.cover(covered)
+            # Late arrivals: another hook may have been accepted while we were
+            # rebuilding. A full rebuild already saw everything, so skip this
+            # when merged is None.
             if merged is not None:
-                for _ in range(_PENDING_DRAIN_MAX_PASSES):
-                    late = _drain_pending(out)
+                for _ in range(_LATE_ARRIVAL_PASSES):
+                    late = coordinator.pending(operations=code_update_only)
                     if not late:
                         break
                     ok = _rebuild_code(
                         watch_path,
-                        changed_paths=late,
+                        changed_paths=_merged_change_set([], late, None),
                         follow_symlinks=follow_symlinks,
                         force=force,
                         no_cluster=no_cluster,
                         acquire_lock=False,
                     ) and ok
+                    if not ok:
+                        break
+                    coordinator.cover(late)
             return ok
 
     watch_root = watch_path.resolve()
