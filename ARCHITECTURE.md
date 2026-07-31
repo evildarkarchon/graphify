@@ -27,8 +27,40 @@ Each stage is a single function in its own module. They communicate through plai
 | `security.py` | validation helpers | URL / path / label → validated or raises |
 | `validate.py` | `validate_extraction(data)` | extraction dict → raises on schema errors |
 | `serve.py` | `start_server(graph_path)` | graph file path → MCP stdio server |
-| `watch.py` | `watch(root, flag_path)` | directory → writes flag file on change |
+| `watch.py` | `watch(root)` | directory → submits a code update on change; also hosts the shared code-update adapter helpers the CLI and hooks call |
+| `generation/` | `CorpusGraph(corpus).code_update(...)` | request → published graph generation |
 | `benchmark.py` | `run_benchmark(graph_path)` | graph file → corpus vs subgraph token comparison |
+
+## Graph generation ownership
+
+`graphify.generation` owns the graph-generation lifecycle for one corpus and is
+the only module that publishes canonical artifacts. Its public interface is the
+corpus-bound `CorpusGraph`, which exposes full extraction, code update, and
+reclustering. Every other entrypoint is an adapter: it translates a request,
+picks a completion policy, renders the terminal outcome, and does nothing else.
+
+| Entrypoint | Completion | Notes |
+|------------|------------|-------|
+| `graphify update` | `WaitUntilCovered` | returns only once the request is covered |
+| `watch` | `WaitUntilCovered` | submits the debounced batch as one request |
+| git hooks | `ReturnWhenQueued`, then executes | the change set is durable before any work starts |
+
+### Compatibility transition window
+
+`graphify.watch._rebuild_code` is the helper hooks installed before this
+refactor call. It remains importable with its old signature, but it now only
+submits a code update and maps the terminal outcome to its legacy boolean;
+`follow_symlinks`, `no_cluster`, `acquire_lock`, and `block_on_lock` are
+accepted and inert. New hooks call `_background_code_update` instead.
+
+Retirement criteria for `_rebuild_code`: the remaining lifecycle operations are
+routed through `CorpusGraph` (issues #12–#14) and installed hooks have been
+re-emitted by `graphify hook install`. Until then a hook from an older install
+keeps working unchanged.
+
+A code update publishes a *raw* graph generation: contributions, `graph.json`,
+and the manifest. Community identity, labels, analysis, and `GRAPH_REPORT.md`
+are republished by reclustering, which is a separate operation.
 
 ## Extraction output schema
 

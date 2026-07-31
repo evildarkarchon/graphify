@@ -267,11 +267,11 @@ def test_code_update_never_clears_pending_semantic_state(tmp_path) -> None:
 def test_the_code_rebuild_entrypoint_never_clears_pending_semantic_state(
     tmp_path,
 ) -> None:
-    """Keep pending state across `graphify update`'s LLM-free rebuild path.
+    """Keep pending state across the compatibility rebuild entrypoint.
 
-    This is the entrypoint a user actually runs, and it still publishes through
-    the compatibility handoff rather than the owned operation. It performs no
-    interpretation either, so it must not retire the pending marker.
+    This is the helper installed hooks still call. It now submits the owned
+    operation like every other entrypoint, and that operation performs no
+    interpretation, so it must not retire the pending marker.
     """
     from graphify.watch import _rebuild_code
 

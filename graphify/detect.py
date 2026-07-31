@@ -1492,7 +1492,7 @@ def _to_relative_for_storage(key: str, root: Path) -> str:
 
     Keys outside ``root`` (out-of-tree symlinked sources, external --include
     paths) and already-relative keys pass through unchanged — mirrors the
-    fallback in :func:`graphify.watch._relativize_source_files` so the
+    fallback in :func:`graphify.cache._relativize_source_files_in` so the
     on-disk artifact survives the round-trip even when some paths cannot be
     portably encoded.
 

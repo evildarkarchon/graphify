@@ -455,9 +455,11 @@ def _relativize_source_files_in(payload: dict, root: Path) -> None:
     """Mutate ``payload`` to rewrite absolute ``source_file`` fields as
     forward-slash relative paths from ``root``.
 
-    Mirror of :func:`graphify.watch._relativize_source_files` so cached
-    extraction fragments persist in portable form (#777). Already-relative
-    fields and out-of-root paths pass through unchanged.
+    Mirror of the portable ``source_file`` rule
+    :func:`graphify.generation._contributions._relative_source_identity`
+    enforces on admitted evidence, so cached extraction fragments persist in
+    the same portable form (#777). Already-relative fields and out-of-root
+    paths pass through unchanged.
 
     Only ``root`` is resolved — ``source_file`` itself is relativized
     symbolically so in-root symlinks keep their original name rather than

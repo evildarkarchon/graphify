@@ -113,10 +113,10 @@ changed = [Path(f.strip()) for f in changed_raw.strip().splitlines() if f.strip(
 if not changed:
     sys.exit(0)
 
-print(f'[graphify hook] {len(changed)} file(s) changed - rebuilding graph...')
+print(f'[graphify hook] {len(changed)} file(s) changed - submitting a Code update...')
 
 try:
-    from graphify.watch import _rebuild_code, _apply_resource_limits
+    from graphify.watch import _background_code_update, _apply_resource_limits
     _apply_resource_limits()
     _timeout = int(os.environ.get('GRAPHIFY_REBUILD_TIMEOUT', '600'))
     if _timeout > 0:
@@ -135,10 +135,13 @@ try:
     _out = os.environ.get('GRAPHIFY_OUT', 'graphify-out')
     _saved = Path(_out) / '.graphify_root'
     if _saved.exists():
+        # The marker names the absolute Corpus root the owning module published,
+        # so a graphify-out/ carried into another checkout can point somewhere
+        # that no longer exists; fall back to the repo the hook fired in.
         _txt = _saved.read_text(encoding='utf-8').strip()
-        if _txt:
+        if _txt and Path(_txt).is_dir():
             _root = Path(_txt)
-    _rebuild_code(_root, changed_paths=changed, force=_force)
+    _background_code_update(_root, changed_paths=changed, force=_force)
     # Refresh the work-memory lessons doc when saved Q&A outcomes exist
     # (best-effort; never fails the hook).
     try:
@@ -159,7 +162,7 @@ except Exception as exc:
 """
 
 _REBUILD_BODY_CHECKOUT = """\
-from graphify.watch import _rebuild_code, _apply_resource_limits
+from graphify.watch import _background_code_update, _apply_resource_limits
 from pathlib import Path
 import os, signal, sys, threading
 try:
@@ -177,17 +180,21 @@ try:
             _watchdog.daemon = True
             _watchdog.start()
     _force = os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
-    # post-checkout: branch switch can touch arbitrary files; full rebuild path
-    # (no changed_paths) is correct here. The flock inside _rebuild_code still
-    # prevents pile-ups when commit + checkout fire back-to-back.
+    # post-checkout: branch switch can touch arbitrary files, so no changed_paths
+    # is the honest hint here. The one Corpus executor lease inside the Code
+    # update still prevents pile-ups when commit + checkout fire back-to-back,
+    # and the queued record means neither hook's change set can be dropped.
     _root = Path('.')
     _out = os.environ.get('GRAPHIFY_OUT', 'graphify-out')
     _saved = Path(_out) / '.graphify_root'
     if _saved.exists():
+        # The marker names the absolute Corpus root the owning module published,
+        # so a graphify-out/ carried into another checkout can point somewhere
+        # that no longer exists; fall back to the repo the hook fired in.
         _txt = _saved.read_text(encoding='utf-8').strip()
-        if _txt:
+        if _txt and Path(_txt).is_dir():
             _root = Path(_txt)
-    _rebuild_code(_root, force=_force)
+    _background_code_update(_root, force=_force)
     # Refresh the work-memory lessons doc when saved Q&A outcomes exist
     # (best-effort; never fails the hook).
     try:

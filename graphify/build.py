@@ -573,7 +573,7 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         # label/source_file and would otherwise skip the node entirely.
         _fold_node_aliases(node)
         # Default missing/None file_type to "concept" so legacy graph.json
-        # entries (and stub nodes preserved by `_rebuild_code` from older
+        # entries (and stub nodes a Code update carries forward from older
         # graphify versions that didn't always populate file_type) don't
         # trigger spurious "invalid file_type 'None'" validator warnings (#660).
         if node.get("file_type") in (None, ""):

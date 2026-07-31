@@ -1036,6 +1036,28 @@ def _is_semantic_cache_scope_fix_line(line: str) -> bool:
     ) or stripped.startswith("saved = save_semantic_cache(")
 
 
+def _is_watch_submission_line(line: str) -> bool:
+    """Whether a line describes what ``--watch`` does with a change (#9).
+
+    The watcher used to sort a batch into "code" (rebuild now) and "everything
+    else" (raise ``needs_update``). It now submits every relevant change as one
+    Code update and lets the operation decide what the evidence means, so the
+    old two-bullet description is wrong on both bullets: a Code update publishes
+    a Raw graph generation rather than a clustered one, and only the generation's
+    own Stale semantic evidence raises the pending marker. Both the removed and
+    the replacement lines are sanctioned here.
+    """
+    stripped = line.strip()
+    return stripped.startswith(
+        (
+            "Replace INPUT_PATH with the folder to watch",
+            "- **Code files",
+            "- **Docs, papers, or images:**",
+            "- **Sources already carrying semantic",
+        )
+    )
+
+
 # Every line that may differ between a rendered monolith and its pristine v8
 # baseline. Each predicate documents one sanctioned change-class; a blank line is
 # allowed because the multi-line fix blocks insert spacing. Anything else failing
@@ -1057,6 +1079,7 @@ _SANCTIONED_MONOLITH_DIFFS = (
     _is_obsidian_usage_comment_line,
     _is_uv_from_interpreter_fix_line,
     _is_semantic_cache_scope_fix_line,
+    _is_watch_submission_line,
 )
 
 

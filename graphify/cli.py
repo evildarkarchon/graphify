@@ -1912,23 +1912,36 @@ def dispatch_command(cmd: str) -> None:
         if watch_arg is not None:
             watch_path = Path(watch_arg)
         else:
-            # Try to recover the scan root saved by the last full build
+            # Try to recover the scan root saved by the last full build. The
+            # marker records the absolute Corpus the owning module published, so
+            # a graphify-out/ that travelled to another checkout names a root
+            # that is not there any more; fall back to the working directory
+            # rather than refusing to update a graph that is otherwise fine
+            # (#777 kept this portable by storing the relative spelling, which a
+            # Corpus identity cannot do without being retargetable by a chdir).
             saved = Path(_GRAPHIFY_OUT) / ".graphify_root"
-            if saved.exists():
-                watch_path = Path(saved.read_text(encoding="utf-8").strip())
-            else:
-                watch_path = Path(".")
+            recorded = (
+                Path(saved.read_text(encoding="utf-8").strip())
+                if saved.exists()
+                else None
+            )
+            watch_path = recorded if recorded is not None and recorded.exists() else Path(".")
         if not watch_path.exists():
             print(f"error: path not found: {watch_path}", file=sys.stderr)
             sys.exit(1)
-        from graphify.watch import _rebuild_code
+        from graphify.watch import _submit_code_update
 
         print(f"Re-extracting code files in {watch_path} (no LLM needed)...")
-        # Interactive CLI: block on the per-repo lock rather than skip, so the
-        # user sees their explicit `graphify update` complete instead of
-        # exiting silently when a hook-driven rebuild happens to be running.
-        ok = _rebuild_code(watch_path, force=force, no_cluster=no_cluster, block_on_lock=True)
-        if ok:
+        if no_cluster:
+            # Accepted for compatibility and now implied: a Code update publishes
+            # a Raw graph generation, which is exactly what this flag asked for.
+            print("Note: --no-cluster is implied; a Code update publishes a Raw graph generation.")
+        # The interactive shape of the shared adapter: it submits with
+        # WaitUntilCovered, so this command returns only once the requested state
+        # has been published — by this process or by whichever executor covered it
+        # first — rather than exiting silently when a hook-driven rebuild happens
+        # to hold the Corpus lease. ``prefix=""`` keeps the CLI's plain voice.
+        if _submit_code_update(watch_path, force=force, prefix=""):
             print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")
             if not (
                 os.environ.get("GEMINI_API_KEY")
@@ -1939,8 +1952,10 @@ def dispatch_command(cmd: str) -> None:
             ):
                 print("Tip: set GEMINI_API_KEY or GOOGLE_API_KEY to use Gemini for semantic extraction.")
         else:
+            # The outcome itself was already rendered above; this is the exit
+            # contract scripts depend on, not a second explanation.
             print(
-                "Nothing to update or rebuild failed — check output above.",
+                "The Corpus was not updated — see the refusal or failure above.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -3665,7 +3680,7 @@ def dispatch_command(cmd: str) -> None:
         # shrink check against the existing file (existing_graph_node_count).
         #
         # Trade-off: this reuses to_json's coarse node-count guard, not the
-        # source-aware _check_shrink that watch/update use. On an incremental run
+        # per-source shrink accounting a Code update applies. On an incremental run
         # a legitimate deletion that coincides with an unrelated transient chunk
         # failure can therefore be refused here — recoverable by re-running or
         # passing --allow-partial (the good graph is preserved and the manifest

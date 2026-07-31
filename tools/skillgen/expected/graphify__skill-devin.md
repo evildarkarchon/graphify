@@ -1438,10 +1438,10 @@ Start a background watcher that monitors a folder and auto-updates the graph whe
 python3 -m graphify.watch INPUT_PATH --debounce 3
 ```
 
-Replace INPUT_PATH with the folder to watch. Behavior depends on what changed:
+Replace INPUT_PATH with the folder to watch. Every relevant change is submitted as one code update, which reconciles the corpus structurally and never calls an LLM:
 
-- **Code files only (.py, .ts, .go, etc.):** re-runs AST extraction + rebuild + cluster immediately, no LLM needed. `graph.json` and `GRAPH_REPORT.md` are updated automatically.
-- **Docs, papers, or images:** writes a `graphify-out/needs_update` flag and prints a notification to run `/graphify --update` (LLM semantic re-extraction required).
+- **Code files, and docs with a structural extractor (.md, .mdx, .qmd):** re-derived and published as a raw graph generation, so `graph.json` is updated automatically. Community labels, analysis, and `GRAPH_REPORT.md` are republished by reclustering, not by a code update.
+- **Sources already carrying semantic (LLM) evidence:** that evidence is preserved rather than overwritten. When the file changed after its last interpretation it is disclosed as stale and `graphify-out/needs_update` is raised — run `/graphify --update` to reinterpret it.
 
 Debounce (default 3s): waits until file activity stops before triggering, so a wave of parallel agent writes doesn't trigger a rebuild per file.
 
